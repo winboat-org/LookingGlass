@@ -36,21 +36,12 @@ static const struct LGMPQueueConfig FRAME_QUEUE_CONFIG =
   1000                //subTimeout
 };
 
-static const struct LGMPQueueConfig HELIOS_QUEUE_CONFIG =
-{
-  LGMP_Q_HELIOS,      //queueID
-  LGMP_Q_HELIOS_LEN,  //numMessages
-  1000                //subTimeout
-};
-
 static const struct LGMPQueueConfig POINTER_QUEUE_CONFIG =
 {
   LGMP_Q_POINTER,     //queueID
   LGMP_Q_POINTER_LEN, //numMesages
   1000                //subTimeout
 };
-
-static const size_t HELIOS_FRAME_POOL_SIZE = 16ull * 1024ull * 1024ull;
 
 static const UINT IDDCX_VERSION_1_10 = 0x1A00;
 
@@ -678,12 +669,6 @@ bool CIndirectDeviceContext::SetupLGMP(size_t alignSize)
     return false;
   }
 
-  if ((status = lgmpHostQueueNew(m_lgmp, HELIOS_QUEUE_CONFIG, &m_heliosQueue)) != LGMP_OK)
-  {
-    DEBUG_ERROR("lgmpHostQueueCreate Failed (Helios): %s", lgmpStatusString(status));
-    return false;
-  }
-
   if ((status = lgmpHostQueueNew(m_lgmp, POINTER_QUEUE_CONFIG, &m_pointerQueue)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostQueueCreate Failed (Pointer): %s", lgmpStatusString(status));
@@ -711,17 +696,10 @@ bool CIndirectDeviceContext::SetupLGMP(size_t alignSize)
   }
 
   const size_t availFrameMem = lgmpHostMemAvail(m_lgmp);
-  m_maxHeliosFrameSize = HELIOS_FRAME_POOL_SIZE;
-  if (m_maxHeliosFrameSize * LGMP_Q_HELIOS_LEN > availFrameMem / 2)
-    m_maxHeliosFrameSize = (availFrameMem / 2) / LGMP_Q_HELIOS_LEN;
-  m_maxHeliosFrameSize = (m_maxHeliosFrameSize - (m_alignSize - 1)) & ~(m_alignSize - 1);
-
-  m_maxFrameSize = availFrameMem - (m_maxHeliosFrameSize * LGMP_Q_HELIOS_LEN);
+  m_maxFrameSize = availFrameMem;
   m_maxFrameSize = (m_maxFrameSize -(m_alignSize - 1)) & ~(m_alignSize - 1);
   m_maxFrameSize /= LGMP_Q_FRAME_LEN;
   DEBUG_INFO("Max Frame Size: %u MiB", (unsigned int)(m_maxFrameSize / 1048576LL));
-  DEBUG_INFO("Max Helios Overlay Frame Size: %u MiB",
-    (unsigned int)(m_maxHeliosFrameSize / 1048576LL));
 
   for (int i = 0; i < LGMP_Q_FRAME_LEN; ++i)
   {
@@ -740,21 +718,6 @@ bool CIndirectDeviceContext::SetupLGMP(size_t alignSize)
     const size_t alignOffset = alignSize - sizeof(FrameBuffer);
     m_frame[i]->offset = (uint32_t)alignOffset;
     m_frameBuffer[i] = (FrameBuffer*)(((uint8_t*)m_frame[i]) + alignOffset);
-  }
-
-  for (int i = 0; i < LGMP_Q_HELIOS_LEN; ++i)
-  {
-    if ((status = lgmpHostMemAllocAligned(m_lgmp, (uint32_t)m_maxHeliosFrameSize,
-        (uint32_t)m_alignSize, &m_heliosMemory[i])) != LGMP_OK)
-    {
-      DEBUG_ERROR("lgmpHostMemAllocAligned Failed (Helios): %s", lgmpStatusString(status));
-      return false;
-    }
-
-    m_heliosFrame[i] = (KVMFRFrame *)lgmpHostMemPtr(m_heliosMemory[i]);
-    const size_t alignOffset = alignSize - sizeof(FrameBuffer);
-    m_heliosFrame[i]->offset = (uint32_t)alignOffset;
-    m_heliosFrameBuffer[i] = (FrameBuffer*)(((uint8_t*)m_heliosFrame[i]) + alignOffset);
   }
 
   WDF_TIMER_CONFIG config;
@@ -803,8 +766,6 @@ void CIndirectDeviceContext::DeInitLGMP()
 
   for (int i = 0; i < LGMP_Q_FRAME_LEN; ++i)
     lgmpHostMemFree(&m_frameMemory[i]);
-  for (int i = 0; i < LGMP_Q_HELIOS_LEN; ++i)
-    lgmpHostMemFree(&m_heliosMemory[i]);
   for (int i = 0; i < LGMP_Q_POINTER_LEN; ++i)
     lgmpHostMemFree(&m_pointerMemory[i]);
   for (int i = 0; i < POINTER_SHAPE_BUFFERS; ++i)
@@ -884,9 +845,6 @@ void CIndirectDeviceContext::ProcessLGMP(bool allowReplug)
     if (m_hasFrame)
       lgmpHostQueuePost(m_frameQueue, 0, m_frameMemory[m_frameIndex]);
   }
-
-  if (lgmpHostQueueNewSubs(m_heliosQueue))
-    ClearDirectFrame();
 
   if (lgmpHostQueueNewSubs(m_pointerQueue))
     ResendCursor();
@@ -1013,217 +971,6 @@ CIndirectDeviceContext::PreparedFrameBuffer CIndirectDeviceContext::PrepareFrame
   result.mem        = fb->data;
 
   m_hasFrame = true;
-out:
-  LeaveCriticalSection(&m_frameLock);
-  return result;
-}
-
-CIndirectDeviceContext::DirectFrameBuffer CIndirectDeviceContext::AcquireDirectFrame(
-  uint32_t width, uint32_t height, uint32_t pitch, uint32_t frameType)
-{
-  DirectFrameBuffer result = {};
-  result.status = 1;
-
-  EnterCriticalSection(&m_frameLock);
-
-  if (!m_lgmp || !m_heliosQueue || !m_ivshmem.GetMem())
-    goto out;
-
-  if (frameType == FRAME_TYPE_INVALID || frameType >= FRAME_TYPE_MAX ||
-      width == 0 || height == 0 || pitch == 0)
-  {
-    result.status = 2;
-    goto out;
-  }
-
-  ProcessLGMP(false);
-
-  if (lgmpHostQueuePending(m_heliosQueue) == LGMP_Q_HELIOS_LEN)
-  {
-    result.status = 3;
-    goto out;
-  }
-
-  for (unsigned attempts = 0; attempts < LGMP_Q_HELIOS_LEN; ++attempts)
-  {
-    if (++m_heliosFrameIndex == LGMP_Q_HELIOS_LEN)
-      m_heliosFrameIndex = 0;
-    if (!m_heliosFramePending[m_heliosFrameIndex])
-      break;
-  }
-
-  if (m_heliosFramePending[m_heliosFrameIndex])
-  {
-    result.status = 4;
-    goto out;
-  }
-
-  const uint64_t frameBytes = (uint64_t)pitch * (uint64_t)height;
-  if (frameBytes > m_maxHeliosFrameSize || frameBytes > UINT32_MAX)
-  {
-    result.status = 5;
-    goto out;
-  }
-
-  KVMFRFrame * fi = m_heliosFrame[m_heliosFrameIndex];
-  FrameBuffer * fb = m_heliosFrameBuffer[m_heliosFrameIndex];
-  if (!fi || !fb)
-    goto out;
-
-  fi->formatVer        = m_formatVer;
-  fi->frameSerial      = m_frameSerial++;
-  fi->screenWidth      = m_width ? m_width : width;
-  fi->screenHeight     = m_height ? m_height : height;
-  fi->dataWidth        = width;
-  fi->dataHeight       = height;
-  fi->frameWidth       = width;
-  fi->frameHeight      = height;
-  fi->rotation         = FRAME_ROT_0;
-  fi->stride           = pitch / 4;
-  fi->pitch            = pitch;
-  fi->flags            = 0;
-  fi->type             = (FrameType)frameType;
-  fi->damageRectsCount = 0;
-  fb->wp = 0;
-
-  m_heliosFramePending[m_heliosFrameIndex] = true;
-
-  result.status = 0;
-  result.frameIndex = (uint32_t)m_heliosFrameIndex;
-  result.frameOffset = (uint32_t)((uintptr_t)fi - (uintptr_t)m_ivshmem.GetMem());
-  result.dataOffset = (uint32_t)((uintptr_t)fb->data - (uintptr_t)m_ivshmem.GetMem());
-  result.maxSize = (uint32_t)m_maxHeliosFrameSize;
-  result.serial = fi->frameSerial;
-
-out:
-  LeaveCriticalSection(&m_frameLock);
-  return result;
-}
-
-uint32_t CIndirectDeviceContext::CommitDirectFrame(
-  uint32_t frameIndex, uint32_t width, uint32_t height, uint32_t pitch,
-  uint32_t frameType, const void * data, size_t dataSize, const RECT& damage)
-{
-  uint32_t result = 1;
-
-  EnterCriticalSection(&m_frameLock);
-
-  if (!m_lgmp || !m_heliosQueue || frameIndex >= LGMP_Q_HELIOS_LEN ||
-      !m_heliosFramePending[frameIndex])
-    goto out;
-
-  KVMFRFrame * fi = m_heliosFrame[frameIndex];
-  FrameBuffer * fb = m_heliosFrameBuffer[frameIndex];
-  if (!fi || !fb)
-    goto out;
-
-  const size_t overlaySize = (size_t)height * (size_t)pitch;
-  if (!data || dataSize < overlaySize || overlaySize > m_maxHeliosFrameSize)
-  {
-    result = 5;
-    goto out;
-  }
-
-  memcpy(fb->data, data, overlaySize);
-
-  fi->formatVer        = m_formatVer;
-  fi->frameSerial      = m_frameSerial++;
-  fi->screenWidth      = m_width ? m_width : width;
-  fi->screenHeight     = m_height ? m_height : height;
-  fi->dataWidth        = width;
-  fi->dataHeight       = height;
-  fi->frameWidth       = width;
-  fi->frameHeight      = height;
-  fi->rotation         = FRAME_ROT_0;
-  fi->stride           = pitch / 4;
-  fi->pitch            = pitch;
-  fi->flags            = 0;
-  fi->type             = (FrameType)frameType;
-  fi->damageRectsCount = 1;
-  fi->damageRects[0].x = damage.left < 0 ? 0 : (uint32_t)damage.left;
-  fi->damageRects[0].y = damage.top < 0 ? 0 : (uint32_t)damage.top;
-  fi->damageRects[0].width = width;
-  fi->damageRects[0].height = height;
-  fb->wp = (uint32_t)overlaySize;
-
-  LGMP_STATUS status = lgmpHostQueuePost(m_heliosQueue, 0, m_heliosMemory[frameIndex]);
-  if (status != LGMP_OK)
-  {
-    result = status == LGMP_ERR_QUEUE_FULL ? 3 : 4;
-    goto out;
-  }
-
-  ProcessLGMP(false);
-  result = 0;
-
-out:
-  if (frameIndex < LGMP_Q_HELIOS_LEN)
-    m_heliosFramePending[frameIndex] = false;
-  LeaveCriticalSection(&m_frameLock);
-  return result;
-}
-
-uint32_t CIndirectDeviceContext::ClearDirectFrame()
-{
-  uint32_t result = 1;
-
-  EnterCriticalSection(&m_frameLock);
-
-  if (!m_lgmp || !m_heliosQueue)
-    goto out;
-
-  ProcessLGMP(false);
-  if (lgmpHostQueuePending(m_heliosQueue) == LGMP_Q_HELIOS_LEN)
-  {
-    result = 3;
-    goto out;
-  }
-
-  for (unsigned attempts = 0; attempts < LGMP_Q_HELIOS_LEN; ++attempts)
-  {
-    if (++m_heliosFrameIndex == LGMP_Q_HELIOS_LEN)
-      m_heliosFrameIndex = 0;
-    if (!m_heliosFramePending[m_heliosFrameIndex])
-      break;
-  }
-
-  if (m_heliosFramePending[m_heliosFrameIndex])
-  {
-    result = 4;
-    goto out;
-  }
-
-  KVMFRFrame * fi = m_heliosFrame[m_heliosFrameIndex];
-  FrameBuffer * fb = m_heliosFrameBuffer[m_heliosFrameIndex];
-  if (!fi || !fb)
-    goto out;
-
-  fi->formatVer        = m_formatVer;
-  fi->frameSerial      = m_frameSerial++;
-  fi->screenWidth      = m_width;
-  fi->screenHeight     = m_height;
-  fi->dataWidth        = 0;
-  fi->dataHeight       = 0;
-  fi->frameWidth       = 0;
-  fi->frameHeight      = 0;
-  fi->rotation         = FRAME_ROT_0;
-  fi->stride           = 0;
-  fi->pitch            = 0;
-  fi->flags            = 0;
-  fi->type             = FRAME_TYPE_INVALID;
-  fi->damageRectsCount = 0;
-  fb->wp = 0;
-
-  LGMP_STATUS status = lgmpHostQueuePost(m_heliosQueue, 0, m_heliosMemory[m_heliosFrameIndex]);
-  if (status != LGMP_OK)
-  {
-    result = status == LGMP_ERR_QUEUE_FULL ? 3 : 4;
-    goto out;
-  }
-
-  ProcessLGMP(false);
-  result = 0;
-
 out:
   LeaveCriticalSection(&m_frameLock);
   return result;

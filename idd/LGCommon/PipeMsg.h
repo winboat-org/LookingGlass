@@ -23,10 +23,6 @@
 #include <stdint.h>
 
 #define LG_PIPE_NAME "\\\\.\\pipe\\LookingGlassIDD"
-#define LG_HELIOS_PIPE_NAME "\\\\.\\pipe\\LookingGlassIDDHelios"
-#define LG_HELIOS_UPLOAD_MAPPING_NAME "Global\\LookingGlassIDDHeliosUpload"
-#define LG_HELIOS_UPLOAD_SIZE (64u * 1024u * 1024u)
-#define LG_HELIOS_DIRECT_PRESENT_VERSION 1
 
 struct LGPipeMsg
 {
@@ -36,11 +32,7 @@ struct LGPipeMsg
     SETCURSORPOS,
     SETDISPLAYMODE,
     GPUSTATUS,
-    RELOADSETTINGS,
-    HELIOS_ACQUIRE_FRAME,
-    HELIOS_ACQUIRE_FRAME_REPLY,
-    HELIOS_COMMIT_FRAME,
-    HELIOS_COMMIT_FRAME_REPLY
+    RELOADSETTINGS
   }
   type;
   union
@@ -65,51 +57,5 @@ struct LGPipeMsg
       bool software;
     }
     gpuStatus;
-
-    struct
-    {
-      uint32_t version;
-      uint32_t width;
-      uint32_t height;
-      uint32_t pitch;
-      uint32_t frameType;
-    }
-    heliosAcquire;
-
-    struct
-    {
-      uint32_t version;
-      uint32_t status;
-      uint32_t frameIndex;
-      uint32_t frameOffset;
-      uint32_t dataOffset;
-      uint32_t maxSize;
-      uint32_t serial;
-    }
-    heliosAcquireReply;
-
-    struct
-    {
-      uint32_t version;
-      uint32_t frameIndex;
-      uint32_t width;
-      uint32_t height;
-      uint32_t pitch;
-      uint32_t frameType;
-      uint32_t damageX;
-      uint32_t damageY;
-      uint32_t damageWidth;
-      uint32_t damageHeight;
-    }
-    heliosCommit;
-
-    uint8_t heliosWirePadding[64];
-
-    struct
-    {
-      uint32_t version;
-      uint32_t status;
-    }
-    heliosCommitReply;
   };
 };

@@ -34,10 +34,8 @@
 
 #define LGMP_Q_POINTER     1
 #define LGMP_Q_FRAME       2
-#define LGMP_Q_HELIOS      3
 
 #define LGMP_Q_FRAME_LEN   2
-#define LGMP_Q_HELIOS_LEN  2
 #define LGMP_Q_POINTER_LEN 32
 
 

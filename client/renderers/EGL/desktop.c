@@ -76,13 +76,6 @@ struct EGL_Desktop
   int spiceWidth, spiceHeight;
   EGL_Texture * spiceTexture;
 
-  bool heliosVisible;
-  int heliosX, heliosY;
-  int heliosWidth, heliosHeight;
-  EGL_Texture * heliosTexture;
-  EGL_DesktopRects * heliosMesh;
-  CountedBuffer * heliosMatrix;
-
   // scale algorithm
   int scaleAlgo;
 
@@ -173,19 +166,6 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
     return false;
   }
 
-  if (!egl_desktopRectsInit(&desktop->heliosMesh, 1))
-  {
-    DEBUG_ERROR("Failed to initialize the Helios overlay mesh");
-    return false;
-  }
-
-  desktop->heliosMatrix = countedBufferNew(6 * sizeof(GLfloat));
-  if (!desktop->heliosMatrix)
-  {
-    DEBUG_ERROR("Failed to allocate the Helios matrix buffer");
-    return false;
-  }
-
   if (!egl_initDesktopShader(
     &desktop->shader,
     b_shader_desktop_vert    , b_shader_desktop_vert_size,
@@ -264,13 +244,10 @@ void egl_desktopFree(EGL_Desktop ** desktop)
 
   egl_textureFree    (&(*desktop)->texture         );
   egl_textureFree    (&(*desktop)->spiceTexture    );
-  egl_textureFree    (&(*desktop)->heliosTexture   );
   egl_shaderFree     (&(*desktop)->shader   .shader);
   egl_shaderFree     (&(*desktop)->dmaShader.shader);
   egl_desktopRectsFree(&(*desktop)->mesh           );
-  egl_desktopRectsFree(&(*desktop)->heliosMesh     );
   countedBufferRelease(&(*desktop)->matrix         );
-  countedBufferRelease(&(*desktop)->heliosMatrix   );
 
   egl_postProcessFree(&(*desktop)->pp);
 
@@ -448,75 +425,6 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
   return false;
 }
 
-bool egl_desktopHeliosUpdate(EGL_Desktop * desktop, const KVMFRFrame * kvmfr,
-    const FrameBuffer * frame)
-{
-  if (kvmfr->type == FRAME_TYPE_INVALID ||
-      kvmfr->dataWidth == 0 ||
-      kvmfr->dataHeight == 0)
-  {
-    desktop->heliosVisible = false;
-    return true;
-  }
-
-  enum EGL_PixelFormat pixFmt;
-  switch(kvmfr->type)
-  {
-    case FRAME_TYPE_BGRA:
-      pixFmt = EGL_PF_BGRA;
-      break;
-    case FRAME_TYPE_RGBA:
-      pixFmt = EGL_PF_RGBA;
-      break;
-    default:
-      DEBUG_WARN("Unsupported Helios overlay frame format: %d", kvmfr->type);
-      desktop->heliosVisible = false;
-      return true;
-  }
-
-  if (!desktop->heliosTexture)
-    if (!egl_textureInit(&desktop->heliosTexture, desktop->display,
-          EGL_TEXTYPE_FRAMEBUFFER))
-    {
-      DEBUG_ERROR("Failed to initialize the Helios overlay texture");
-      desktop->heliosVisible = false;
-      return false;
-    }
-
-  if (desktop->heliosWidth  != (int)kvmfr->dataWidth ||
-      desktop->heliosHeight != (int)kvmfr->dataHeight ||
-      desktop->heliosTexture->format.pitch != kvmfr->pitch)
-  {
-    if (!egl_textureSetup(desktop->heliosTexture, pixFmt,
-          kvmfr->dataWidth, kvmfr->dataHeight, kvmfr->stride, kvmfr->pitch))
-    {
-      DEBUG_ERROR("Failed to setup the Helios overlay texture");
-      desktop->heliosVisible = false;
-      return false;
-    }
-  }
-
-  if (!egl_textureUpdateFromFrame(desktop->heliosTexture, frame, NULL, 0))
-  {
-    DEBUG_ERROR("Failed to update the Helios overlay texture");
-    desktop->heliosVisible = false;
-    return false;
-  }
-
-  desktop->heliosX = 0;
-  desktop->heliosY = 0;
-  if (kvmfr->damageRectsCount > 0)
-  {
-    desktop->heliosX = kvmfr->damageRects[0].x;
-    desktop->heliosY = kvmfr->damageRects[0].y;
-  }
-  desktop->heliosWidth = kvmfr->dataWidth;
-  desktop->heliosHeight = kvmfr->dataHeight;
-  desktop->heliosVisible = true;
-  atomic_store(&desktop->processFrame, true);
-  return true;
-}
-
 void egl_desktopResize(EGL_Desktop * desktop, int width, int height)
 {
   atomic_store(&desktop->processFrame, true);
@@ -668,89 +576,6 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   egl_shaderUse(shader->shader);
   egl_desktopRectsRender(desktop->mesh);
   glBindTexture(GL_TEXTURE_2D, 0);
-
-  if (desktop->heliosVisible && desktop->heliosTexture)
-  {
-    if (egl_textureProcess(desktop->heliosTexture) == EGL_TEX_STATUS_OK)
-    {
-      struct FrameDamageRect overlayRect = {
-        .x = 0,
-        .y = 0,
-        .width = desktop->heliosWidth,
-        .height = desktop->heliosHeight,
-      };
-      struct DamageRects * overlayDamage = alloca(
-        sizeof(*overlayDamage) + sizeof(struct FrameDamageRect));
-      overlayDamage->count = 1;
-      overlayDamage->rects[0] = overlayRect;
-
-      memcpy(desktop->heliosMatrix->data, desktop->matrix->data, 6 * sizeof(GLfloat));
-      GLfloat * m = (GLfloat *)desktop->heliosMatrix->data;
-      m[4] += m[0] * desktop->heliosX + m[2] * desktop->heliosY;
-      m[5] += m[1] * desktop->heliosX + m[3] * desktop->heliosY;
-
-      egl_desktopRectsUpdate(desktop->heliosMesh, overlayDamage,
-          desktop->heliosWidth, desktop->heliosHeight);
-
-      glActiveTexture(GL_TEXTURE0);
-      egl_textureBind(desktop->heliosTexture);
-
-      EGL_Uniform overlayUniforms[] =
-      {
-        {
-          .type        = EGL_UNIFORM_TYPE_1I,
-          .location    = shader->uScaleAlgo,
-          .i           = { EGL_SCALE_LINEAR },
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_2F,
-          .location    = shader->uDesktopSize,
-          .f           = { desktop->heliosWidth, desktop->heliosHeight },
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_M3x2FV,
-          .location    = shader->uTransform,
-          .m.transpose = GL_FALSE,
-          .m.v         = desktop->heliosMatrix
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_1F,
-          .location    = shader->uNVGain,
-          .f           = { 0.0f }
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_1I,
-          .location    = shader->uCBMode,
-          .f           = { 0 }
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_1I,
-          .location    = shader->uIsHDR,
-          .i           = { false }
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_1I,
-          .location    = shader->uMapHDRtoSDR,
-          .i           = { false }
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_1F,
-          .location    = shader->uMapHDRGain,
-          .f           = { 1.0f }
-        },
-        {
-          .type        = EGL_UNIFORM_TYPE_1I,
-          .location    = shader->uMapHDRPQ,
-          .f           = { false }
-        }
-      };
-
-      egl_shaderSetUniforms(shader->shader, overlayUniforms, ARRAY_LENGTH(overlayUniforms));
-      egl_shaderUse(shader->shader);
-      egl_desktopRectsRender(desktop->heliosMesh);
-      glBindTexture(GL_TEXTURE_2D, 0);
-    }
-  }
 
   return true;
 }

@@ -37,7 +37,6 @@
    (x)->onMouseEvent    && \
    (x)->renderStartup   && \
    (x)->render          && \
-   (x)->onHeliosFrame   && \
    (x)->createTexture   && \
    (x)->freeTexture     && \
    (x)->spiceConfigure  && \
@@ -163,11 +162,6 @@ typedef struct LG_RendererOps
    * Context: frameThread */
   bool (*onFrame)(LG_Renderer * renderer, const FrameBuffer * frame, int dmaFD,
       const FrameDamageRect * damage, int damageCount);
-
-  /* called when there is a new Helios overlay frame
-   * Context: frameThread */
-  bool (*onHeliosFrame)(LG_Renderer * renderer, const KVMFRFrame * kvmfr,
-      const FrameBuffer * frame);
 
   /* called when the rederer is to startup
    * Context: renderThread */

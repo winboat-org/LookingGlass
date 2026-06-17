@@ -568,38 +568,6 @@ int main_cursorThread(void * unused)
   return 0;
 }
 
-static bool processHeliosFrame(PLGMPClientQueue queue, bool * valid)
-{
-  LGMP_STATUS status;
-  bool updated = false;
-  LGMPMessage msg;
-
-  status = lgmpClientProcess(queue, &msg);
-  if (status == LGMP_ERR_QUEUE_EMPTY)
-    return false;
-
-  if (status == LGMP_ERR_INVALID_SESSION ||
-      status == LGMP_ERR_QUEUE_UNSUBSCRIBED ||
-      status == LGMP_ERR_QUEUE_TIMEOUT)
-  {
-    *valid = false;
-    return false;
-  }
-
-  if (status != LGMP_OK)
-    return false;
-
-  KVMFRFrame * frame = (KVMFRFrame *)msg.mem;
-  FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)frame) + frame->offset);
-
-  LG_LOCK(g_state.lgrLock);
-  updated = RENDERER(onHeliosFrame, frame, fb);
-  LG_UNLOCK(g_state.lgrLock);
-
-  lgmpClientMessageDone(queue);
-  return updated;
-}
-
 int main_frameThread(void * unused)
 {
   struct DMAFrameInfo
@@ -611,7 +579,6 @@ int main_frameThread(void * unused)
 
   LGMP_STATUS      status;
   PLGMPClientQueue queue;
-  PLGMPClientQueue heliosQueue = NULL;
 
   uint32_t          frameSerial = 0;
   uint32_t          formatVer   = 0;
@@ -644,47 +611,8 @@ int main_frameThread(void * unused)
     break;
   }
 
-  status = lgmpClientSubscribe(g_state.lgmp, LGMP_Q_HELIOS, &heliosQueue);
-  if (status == LGMP_OK)
-    DEBUG_INFO("Subscribed to Helios overlay queue");
-  else
-    heliosQueue = NULL;
-
   while(g_state.state == APP_STATE_RUNNING && !g_state.stopVideo)
   {
-    if (heliosQueue)
-    {
-      bool heliosValid = true;
-      if (processHeliosFrame(heliosQueue, &heliosValid))
-      {
-        if (g_state.jitRender)
-        {
-          if (atomic_load_explicit(&g_state.pendingCount, memory_order_acquire) < 10)
-            atomic_fetch_add_explicit(&g_state.pendingCount, 1,
-                memory_order_release);
-        }
-        else
-          lgSignalEvent(g_state.frameEvent);
-      }
-
-      if (!heliosValid)
-      {
-        lgmpClientUnsubscribe(&heliosQueue);
-        heliosQueue = NULL;
-      }
-    }
-
-    if (!heliosQueue)
-    {
-      status = lgmpClientSubscribe(g_state.lgmp, LGMP_Q_HELIOS, &heliosQueue);
-      if (status != LGMP_OK)
-      {
-        if (status != LGMP_ERR_NO_SUCH_QUEUE && status != LGMP_ERR_INVALID_SESSION)
-          DEBUG_WARN("lgmpClientSubscribe Failed (Helios): %s", lgmpStatusString(status));
-        heliosQueue = NULL;
-      }
-    }
-
     LGMPMessage msg;
     if ((status = lgmpClientProcess(queue, &msg)) != LGMP_OK)
     {
@@ -958,8 +886,6 @@ int main_frameThread(void * unused)
     app_useSpiceDisplay(false);
   }
 
-  if (heliosQueue)
-    lgmpClientUnsubscribe(&heliosQueue);
   lgmpClientUnsubscribe(&queue);
 
   RENDERER(onRestart);

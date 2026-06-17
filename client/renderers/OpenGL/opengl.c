@@ -43,8 +43,7 @@
 #define FPS_TEXTURE        0
 #define MOUSE_TEXTURE      1
 #define SPICE_TEXTURE      2
-#define HELIOS_TEXTURE     3
-#define TEXTURE_COUNT      4
+#define TEXTURE_COUNT      3
 
 static struct Option opengl_options[] =
 {
@@ -138,7 +137,6 @@ struct Inst
   int               texList;
   int               mouseList;
   int               spiceList;
-  int               heliosList;
   LG_RendererRect   destRect;
   struct IntPoint   spiceSize;
   bool              spiceShow;
@@ -147,22 +145,6 @@ struct Inst
   GLuint            frames[BUFFER_COUNT];
   GLsync            fences[BUFFER_COUNT];
   GLuint            textures[TEXTURE_COUNT];
-
-  LG_Lock           heliosLock;
-  bool              heliosVisible;
-  bool              heliosUpdate;
-  int               heliosX;
-  int               heliosY;
-  int               heliosWidth;
-  int               heliosHeight;
-  int               heliosPitch;
-  FrameType         heliosType;
-  uint8_t         * heliosData;
-  size_t            heliosDataSize;
-  int               heliosTexWidth;
-  int               heliosTexHeight;
-  int               heliosTexPitch;
-  FrameType         heliosTexType;
 
   LG_Lock           mouseLock;
   LG_RendererCursor mouseCursor;
@@ -193,7 +175,6 @@ static void deconfigure(struct Inst * this);
 static enum ConfigStatus configure(struct Inst * this);
 static void updateMouseShape(struct Inst * this);
 static bool drawFrame(struct Inst * this);
-static void drawHelios(struct Inst * this);
 static void drawMouse(struct Inst * this);
 
 const char * opengl_getName(void)
@@ -230,7 +211,6 @@ bool opengl_create(LG_Renderer ** renderer, const LG_RendererParams params,
   LG_LOCK_INIT(this->formatLock);
   LG_LOCK_INIT(this->frameLock );
   LG_LOCK_INIT(this->mouseLock );
-  LG_LOCK_INIT(this->heliosLock);
 
   *needsOpenGL = true;
   return true;
@@ -253,7 +233,6 @@ void opengl_deinitialize(LG_Renderer * renderer)
     glDeleteLists(this->texList  , BUFFER_COUNT);
     glDeleteLists(this->mouseList, 1);
     glDeleteLists(this->spiceList, 1);
-    glDeleteLists(this->heliosList, 1);
   }
 
   deconfigure(this);
@@ -266,8 +245,6 @@ void opengl_deinitialize(LG_Renderer * renderer)
 
   if (this->mouseData)
     free(this->mouseData);
-  if (this->heliosData)
-    free(this->heliosData);
 
   if (this->glContext)
   {
@@ -278,7 +255,6 @@ void opengl_deinitialize(LG_Renderer * renderer)
   LG_LOCK_FREE(this->formatLock);
   LG_LOCK_FREE(this->frameLock );
   LG_LOCK_FREE(this->mouseLock );
-  LG_LOCK_FREE(this->heliosLock);
 
   free(this);
 }
@@ -427,63 +403,6 @@ bool opengl_onFrame(LG_Renderer * renderer, const FrameBuffer * frame, int dmaFd
   return true;
 }
 
-static bool opengl_onHeliosFrame(LG_Renderer * renderer,
-    const KVMFRFrame * kvmfr, const FrameBuffer * frame)
-{
-  struct Inst * this = UPCAST(struct Inst, renderer);
-
-  LG_LOCK(this->heliosLock);
-  if (kvmfr->type == FRAME_TYPE_INVALID ||
-      kvmfr->dataWidth == 0 ||
-      kvmfr->dataHeight == 0)
-  {
-    this->heliosVisible = false;
-    this->heliosUpdate = true;
-    LG_UNLOCK(this->heliosLock);
-    return true;
-  }
-
-  if (kvmfr->type != FRAME_TYPE_BGRA && kvmfr->type != FRAME_TYPE_RGBA)
-  {
-    DEBUG_WARN("Unsupported Helios overlay frame format: %u", kvmfr->type);
-    this->heliosVisible = false;
-    this->heliosUpdate = true;
-    LG_UNLOCK(this->heliosLock);
-    return true;
-  }
-
-  const size_t size = (size_t)kvmfr->dataHeight * (size_t)kvmfr->pitch;
-  if (size > this->heliosDataSize)
-  {
-    uint8_t * data = realloc(this->heliosData, size);
-    if (!data)
-    {
-      DEBUG_ERROR("out of memory");
-      LG_UNLOCK(this->heliosLock);
-      return false;
-    }
-    this->heliosData = data;
-    this->heliosDataSize = size;
-  }
-
-  memcpy(this->heliosData, frame->data, size);
-  this->heliosX = 0;
-  this->heliosY = 0;
-  if (kvmfr->damageRectsCount > 0)
-  {
-    this->heliosX = (int)kvmfr->damageRects[0].x;
-    this->heliosY = (int)kvmfr->damageRects[0].y;
-  }
-  this->heliosWidth = (int)kvmfr->dataWidth;
-  this->heliosHeight = (int)kvmfr->dataHeight;
-  this->heliosPitch = (int)kvmfr->pitch;
-  this->heliosType = kvmfr->type;
-  this->heliosVisible = true;
-  this->heliosUpdate = true;
-  LG_UNLOCK(this->heliosLock);
-  return true;
-}
-
 bool opengl_renderStartup(LG_Renderer * renderer, bool useDMA)
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
@@ -545,7 +464,6 @@ bool opengl_renderStartup(LG_Renderer * renderer, bool useDMA)
   this->texList   = glGenLists(BUFFER_COUNT);
   this->mouseList = glGenLists(1);
   this->spiceList = glGenLists(1);
-  this->heliosList = glGenLists(1);
 
   // create the overlay textures
   glGenTextures(TEXTURE_COUNT, this->textures);
@@ -595,8 +513,6 @@ bool opengl_render(LG_Renderer * renderer, LG_RendererRotate rotate, const bool 
 	    glCallList(this->spiceList);
 	  else
 	    glCallList(this->texList + this->texRIndex);
-	  if (!this->spiceShow)
-	    drawHelios(this);
 	  drawMouse(this);
 
   if (app_renderOverlay(NULL, 0) != 0)
@@ -782,7 +698,6 @@ const LG_RendererOps LGR_OpenGL =
   .onMouseEvent  = opengl_onMouseEvent,
   .onFrameFormat = opengl_onFrameFormat,
   .onFrame       = opengl_onFrame,
-  .onHeliosFrame = opengl_onHeliosFrame,
   .renderStartup = opengl_renderStartup,
   .render        = opengl_render,
   .createTexture = opengl_createTexture,
@@ -1356,90 +1271,6 @@ static bool drawFrame(struct Inst * this)
   LG_UNLOCK(this->formatLock);
   this->texReady = true;
   return true;
-}
-
-static void drawHelios(struct Inst * this)
-{
-  LG_LOCK(this->heliosLock);
-  if (!this->heliosVisible || !this->heliosData)
-  {
-    LG_UNLOCK(this->heliosLock);
-    return;
-  }
-
-  const int width = this->heliosWidth;
-  const int height = this->heliosHeight;
-  const int pitch = this->heliosPitch;
-  const FrameType type = this->heliosType;
-  const int x = this->heliosX;
-  const int y = this->heliosY;
-
-  if (this->heliosUpdate ||
-      this->heliosTexWidth != width ||
-      this->heliosTexHeight != height ||
-      this->heliosTexPitch != pitch ||
-      this->heliosTexType != type)
-  {
-    const GLenum format = type == FRAME_TYPE_RGBA ? GL_RGBA : GL_BGRA;
-
-    glBindTexture(GL_TEXTURE_2D, this->textures[HELIOS_TEXTURE]);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, pitch / 4);
-
-    if (this->heliosTexWidth != width ||
-        this->heliosTexHeight != height ||
-        this->heliosTexPitch != pitch ||
-        this->heliosTexType != type)
-    {
-      glTexImage2D(
-        GL_TEXTURE_2D,
-        0,
-        GL_RGBA8,
-        width,
-        height,
-        0,
-        format,
-        GL_UNSIGNED_BYTE,
-        this->heliosData
-      );
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-      this->heliosTexWidth = width;
-      this->heliosTexHeight = height;
-      this->heliosTexPitch = pitch;
-      this->heliosTexType = type;
-    }
-    else
-    {
-      glTexSubImage2D(
-        GL_TEXTURE_2D,
-        0,
-        0,
-        0,
-        width,
-        height,
-        format,
-        GL_UNSIGNED_BYTE,
-        this->heliosData
-      );
-    }
-
-    this->heliosUpdate = false;
-  }
-
-  glBindTexture(GL_TEXTURE_2D, this->textures[HELIOS_TEXTURE]);
-  glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-  glBegin(GL_TRIANGLE_STRIP);
-    glTexCoord2f(0.0f, 0.0f); glVertex2i(x, y);
-    glTexCoord2f(1.0f, 0.0f); glVertex2i(x + width, y);
-    glTexCoord2f(0.0f, 1.0f); glVertex2i(x, y + height);
-    glTexCoord2f(1.0f, 1.0f); glVertex2i(x + width, y + height);
-  glEnd();
-  glBindTexture(GL_TEXTURE_2D, 0);
-
-  LG_UNLOCK(this->heliosLock);
 }
 
 static void drawMouse(struct Inst * this)

@@ -652,21 +652,6 @@ static bool egl_onFrame(LG_Renderer * renderer, const FrameBuffer * frame, int d
   return true;
 }
 
-static bool egl_onHeliosFrame(LG_Renderer * renderer,
-    const KVMFRFrame * kvmfr, const FrameBuffer * frame)
-{
-  struct Inst * this = UPCAST(struct Inst, renderer);
-
-  if (!egl_desktopHeliosUpdate(this->desktop, kvmfr, frame))
-    return false;
-
-  INTERLOCKED_SECTION(this->desktopDamageLock, {
-    this->desktopDamage[this->desktopDamageIdx].count = -1;
-  });
-
-  return true;
-}
-
 static void debugCallback(GLenum source, GLenum type, GLuint id,
     GLenum severity, GLsizei length, const GLchar * message,
     const void * userParam)
@@ -1304,7 +1289,6 @@ struct LG_RendererOps LGR_EGL =
   .onMouseEvent  = egl_onMouseEvent,
   .onFrameFormat = egl_onFrameFormat,
   .onFrame       = egl_onFrame,
-  .onHeliosFrame = egl_onHeliosFrame,
   .renderStartup = egl_renderStartup,
   .render        = egl_render,
   .createTexture = egl_createTexture,

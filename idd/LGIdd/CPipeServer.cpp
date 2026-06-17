@@ -44,67 +44,10 @@ bool CPipeServer::Init()
     return false;
   }
 
-  SECURITY_DESCRIPTOR heliosPipeSd = {};
-  SECURITY_ATTRIBUTES heliosPipeSa = {};
-  InitializeSecurityDescriptor(&heliosPipeSd, SECURITY_DESCRIPTOR_REVISION);
-  SetSecurityDescriptorDacl(&heliosPipeSd, TRUE, NULL, FALSE);
-  heliosPipeSa.nLength = sizeof(heliosPipeSa);
-  heliosPipeSa.lpSecurityDescriptor = &heliosPipeSd;
-
-  m_heliosUploadMapping.Attach(CreateFileMappingA(
-    INVALID_HANDLE_VALUE,
-    &heliosPipeSa,
-    PAGE_READWRITE,
-    0,
-    LG_HELIOS_UPLOAD_SIZE,
-    LG_HELIOS_UPLOAD_MAPPING_NAME));
-
-  if (!m_heliosUploadMapping.IsValid())
-  {
-    DEBUG_ERROR_HR(GetLastError(), "Failed to create the Helios upload mapping");
-    return false;
-  }
-
-  m_heliosUpload = MapViewOfFile(
-    m_heliosUploadMapping.Get(),
-    FILE_MAP_READ | FILE_MAP_WRITE,
-    0,
-    0,
-    LG_HELIOS_UPLOAD_SIZE);
-
-  if (!m_heliosUpload)
-  {
-    DEBUG_ERROR_HR(GetLastError(), "Failed to map the Helios upload buffer");
-    return false;
-  }
-
-  m_heliosPipe.Attach(CreateNamedPipeA(
-    LG_HELIOS_PIPE_NAME,
-    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-    1,
-    1024,
-    1024,
-    0,
-    &heliosPipeSa));
-
-  if (!m_heliosPipe.IsValid())
-  {
-    DEBUG_ERROR_HR(GetLastError(), "Failed to create the Helios named pipe");
-    return false;
-  }
-
   m_signal.Attach(CreateEvent(NULL, TRUE, FALSE, NULL));
   if (!m_signal.IsValid())
   {
     DEBUG_ERROR_HR(GetLastError(), "Failed to create pipe signal event");
-    return false;
-  }
-
-  m_heliosSignal.Attach(CreateEvent(NULL, TRUE, FALSE, NULL));
-  if (!m_heliosSignal.IsValid())
-  {
-    DEBUG_ERROR_HR(GetLastError(), "Failed to create Helios pipe signal event");
     return false;
   }
 
@@ -123,20 +66,6 @@ bool CPipeServer::Init()
     return false;
   }
 
-  m_heliosThread.Attach(CreateThread(
-    NULL,
-    0,
-    _heliosPipeThread,
-    (LPVOID)this,
-    0,
-    NULL));
-
-  if (!m_heliosThread.IsValid())
-  {
-    DEBUG_ERROR_HR(GetLastError(), "Failed to create the Helios pipe thread");
-    return false;
-  }
-
   DEBUG_TRACE("Pipe Initialized");
   return true;
 }
@@ -147,19 +76,11 @@ void CPipeServer::_DeInit()
   m_connected = false;
   if (m_signal.IsValid())
     SetEvent(m_signal.Get());
-  if (m_heliosSignal.IsValid())
-    SetEvent(m_heliosSignal.Get());
 
   if (m_thread.IsValid())
   {
     WaitForSingleObject(m_thread.Get(), INFINITE);
     m_thread.Close();
-  }
-
-  if (m_heliosThread.IsValid())
-  {
-    WaitForSingleObject(m_heliosThread.Get(), INFINITE);
-    m_heliosThread.Close();
   }
 
   if (m_pipe.IsValid())
@@ -168,21 +89,7 @@ void CPipeServer::_DeInit()
     m_pipe.Close();
   }
 
-  if (m_heliosPipe.IsValid())
-  {
-    FlushFileBuffers(m_heliosPipe.Get());
-    m_heliosPipe.Close();
-  }
-
-  if (m_heliosUpload)
-  {
-    UnmapViewOfFile(m_heliosUpload);
-    m_heliosUpload = nullptr;
-  }
-  m_heliosUploadMapping.Close();
-
   m_signal.Close();
-  m_heliosSignal.Close();
 }
 
 void CPipeServer::DeInit()
@@ -293,14 +200,6 @@ void CPipeServer::Thread()
         HandleReloadSettings();
         break;
 
-      case LGPipeMsg::HELIOS_ACQUIRE_FRAME:
-        HandleHeliosAcquireFrame(msg);
-        break;
-
-      case LGPipeMsg::HELIOS_COMMIT_FRAME:
-        HandleHeliosCommitFrame(msg);
-        break;
-
       default:
         DEBUG_ERROR("Unknown message type %d", msg.type);
         break;
@@ -318,105 +217,6 @@ end:
   m_running   = false;
   m_connected = false;
   DEBUG_TRACE("Pipe thread shutdown");
-}
-
-void CPipeServer::HeliosThread()
-{
-  DEBUG_TRACE("Helios pipe thread started");
-
-  HandleT<EventTraits> ioEvent(CreateEvent(NULL, TRUE, FALSE, NULL));
-  if (!ioEvent.IsValid())
-  {
-    DEBUG_ERROR_HR(GetLastError(), "Can't create event for Helios overlapped I/O");
-    WaitForSingleObject(m_heliosSignal.Get(), 5000);
-    return;
-  }
-
-  while (m_running)
-  {
-    ResetEvent(ioEvent.Get());
-    OVERLAPPED connectOverlapped = { 0 };
-    connectOverlapped.hEvent = ioEvent.Get();
-
-    if (!ConnectNamedPipe(m_heliosPipe.Get(), &connectOverlapped))
-    {
-      DWORD dwError = GetLastError();
-      switch (dwError)
-      {
-      case ERROR_PIPE_CONNECTED:
-        break;
-      case ERROR_IO_PENDING:
-      {
-        HANDLE hWait[] = { ioEvent.Get(), m_heliosSignal.Get() };
-        switch (WaitForMultipleObjects(2, hWait, FALSE, INFINITE))
-        {
-        case WAIT_OBJECT_0:
-          GetOverlappedResult(m_heliosPipe.Get(), &connectOverlapped, &dwError, FALSE);
-          break;
-        case WAIT_OBJECT_0 + 1:
-          CancelIo(m_heliosPipe.Get());
-          WaitForSingleObject(ioEvent.Get(), INFINITE);
-          continue;
-        }
-        break;
-      }
-      default:
-        DEBUG_ERROR_HR(dwError, "Error connecting to the Helios named pipe");
-        goto end;
-      }
-    }
-
-    while (m_running)
-    {
-      ResetEvent(ioEvent.Get());
-      OVERLAPPED readOverlapped = { 0 };
-      readOverlapped.hEvent = ioEvent.Get();
-      LGPipeMsg msg = {};
-      if (!ReadFile(m_heliosPipe.Get(), &msg, sizeof(msg), NULL, &readOverlapped))
-      {
-        DWORD dwError = GetLastError();
-        if (dwError != ERROR_IO_PENDING)
-          break;
-
-        HANDLE hWait[] = { ioEvent.Get(), m_heliosSignal.Get() };
-        switch (WaitForMultipleObjects(2, hWait, FALSE, INFINITE))
-        {
-        case WAIT_OBJECT_0:
-          break;
-        case WAIT_OBJECT_0 + 1:
-          CancelIo(m_heliosPipe.Get());
-          WaitForSingleObject(ioEvent.Get(), INFINITE);
-          goto disconnect;
-        }
-      }
-
-      DWORD bytesRead = 0;
-      GetOverlappedResult(m_heliosPipe.Get(), &readOverlapped, &bytesRead, TRUE);
-      if (bytesRead != sizeof(msg) || msg.size != sizeof(msg))
-        break;
-
-      switch (msg.type)
-      {
-      case LGPipeMsg::HELIOS_ACQUIRE_FRAME:
-        HandleHeliosAcquireFrame(msg);
-        break;
-      case LGPipeMsg::HELIOS_COMMIT_FRAME:
-        HandleHeliosCommitFrame(msg);
-        break;
-      default:
-        DEBUG_ERROR("Unknown Helios pipe message type %d", msg.type);
-        break;
-      }
-    }
-
-disconnect:
-    DisconnectNamedPipe(m_heliosPipe.Get());
-    if (m_running)
-      ResetEvent(m_heliosSignal.Get());
-  }
-
-end:
-  DEBUG_TRACE("Helios pipe thread shutdown");
 }
 
 void CPipeServer::WriteMsg(const LGPipeMsg & msg)
@@ -446,88 +246,14 @@ void CPipeServer::WriteMsg(const LGPipeMsg & msg)
   FlushFileBuffers(m_pipe.Get());
 }
 
-void CPipeServer::WriteHeliosMsg(const LGPipeMsg & msg)
-{
-  DWORD written;
-  if (!WriteFile(m_heliosPipe.Get(), &msg, sizeof(msg), &written, NULL))
-    DEBUG_WARN_HR(GetLastError(), "WriteFile failed on the Helios pipe");
-}
-
 void CPipeServer::HandleReloadSettings()
 {
   DEBUG_INFO("TODO: reload settings");
 }
 
-void CPipeServer::HandleHeliosAcquireFrame(const LGPipeMsg & msg)
-{
-  LGPipeMsg reply = {};
-  reply.size = sizeof(reply);
-  reply.type = LGPipeMsg::HELIOS_ACQUIRE_FRAME_REPLY;
-  reply.heliosAcquireReply.version = LG_HELIOS_DIRECT_PRESENT_VERSION;
-  reply.heliosAcquireReply.status = 1;
-
-  if (msg.heliosAcquire.version != LG_HELIOS_DIRECT_PRESENT_VERSION)
-    reply.heliosAcquireReply.status = 2;
-  else if (m_deviceContext)
-  {
-    auto frame = m_deviceContext->AcquireDirectFrame(
-      msg.heliosAcquire.width,
-      msg.heliosAcquire.height,
-      msg.heliosAcquire.pitch,
-      msg.heliosAcquire.frameType);
-    reply.heliosAcquireReply.status = frame.status;
-    reply.heliosAcquireReply.frameIndex = frame.frameIndex;
-    reply.heliosAcquireReply.frameOffset = frame.frameOffset;
-    reply.heliosAcquireReply.dataOffset = frame.dataOffset;
-    reply.heliosAcquireReply.maxSize = frame.maxSize;
-    reply.heliosAcquireReply.serial = frame.serial;
-  }
-
-  WriteHeliosMsg(reply);
-}
-
-void CPipeServer::HandleHeliosCommitFrame(const LGPipeMsg & msg)
-{
-  LGPipeMsg reply = {};
-  reply.size = sizeof(reply);
-  reply.type = LGPipeMsg::HELIOS_COMMIT_FRAME_REPLY;
-  reply.heliosCommitReply.version = LG_HELIOS_DIRECT_PRESENT_VERSION;
-  reply.heliosCommitReply.status = 1;
-
-  if (msg.heliosCommit.version != LG_HELIOS_DIRECT_PRESENT_VERSION)
-    reply.heliosCommitReply.status = 2;
-  else if (msg.heliosCommit.width == 0 || msg.heliosCommit.height == 0)
-    HandleHeliosClearFrame(reply);
-  else if (m_deviceContext)
-  {
-    RECT damage = {};
-    damage.left = msg.heliosCommit.damageX;
-    damage.top = msg.heliosCommit.damageY;
-    damage.right = msg.heliosCommit.damageX + msg.heliosCommit.damageWidth;
-    damage.bottom = msg.heliosCommit.damageY + msg.heliosCommit.damageHeight;
-    reply.heliosCommitReply.status = m_deviceContext->CommitDirectFrame(
-      msg.heliosCommit.frameIndex,
-      msg.heliosCommit.width,
-      msg.heliosCommit.height,
-      msg.heliosCommit.pitch,
-      msg.heliosCommit.frameType,
-      m_heliosUpload,
-      LG_HELIOS_UPLOAD_SIZE,
-      damage);
-  }
-
-  WriteHeliosMsg(reply);
-}
-
-void CPipeServer::HandleHeliosClearFrame(LGPipeMsg & reply)
-{
-  if (m_deviceContext)
-    reply.heliosCommitReply.status = m_deviceContext->ClearDirectFrame();
-}
-
 void CPipeServer::SetDeviceContext(CIndirectDeviceContext * context)
 {
-  m_deviceContext = context;
+  UNREFERENCED_PARAMETER(context);
 }
 
 void CPipeServer::SetCursorPos(uint32_t x, uint32_t y)

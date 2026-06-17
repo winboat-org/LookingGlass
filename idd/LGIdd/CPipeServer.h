@@ -38,33 +38,21 @@ class CPipeServer
 {
   private:
     HandleT<HANDLETraits>     m_pipe;
-    HandleT<HANDLETraits>     m_heliosPipe;
-    HandleT<HANDLETraits>     m_heliosUploadMapping;
     HandleT<HANDLENullTraits> m_thread;
-    HandleT<HANDLENullTraits> m_heliosThread;
     HandleT<EventTraits>      m_signal;
-    HandleT<EventTraits>      m_heliosSignal;
     std::vector<LGPipeMsg>    m_queue;
 
     bool m_running   = false;
     bool m_connected = false;
-    CIndirectDeviceContext * m_deviceContext = nullptr;
-    void * m_heliosUpload = nullptr;
 
     void _DeInit();
 
     static DWORD WINAPI _pipeThread(LPVOID lpParam) { ((CPipeServer*)lpParam)->Thread(); return 0; }
-    static DWORD WINAPI _heliosPipeThread(LPVOID lpParam) { ((CPipeServer*)lpParam)->HeliosThread(); return 0; }
     void Thread();
-    void HeliosThread();
 
     void WriteMsg(const LGPipeMsg & msg);
-    void WriteHeliosMsg(const LGPipeMsg & msg);
 
     void HandleReloadSettings();
-    void HandleHeliosAcquireFrame(const LGPipeMsg & msg);
-    void HandleHeliosCommitFrame(const LGPipeMsg & msg);
-    void HandleHeliosClearFrame(LGPipeMsg & reply);
 
   public:
     ~CPipeServer() { DeInit(); }

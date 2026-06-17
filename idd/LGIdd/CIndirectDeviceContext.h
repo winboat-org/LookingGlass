@@ -62,7 +62,6 @@ private:
   PLGMPHost      m_lgmp       = nullptr;
   WDFTIMER       m_lgmpTimer  = nullptr;
   PLGMPHostQueue m_frameQueue = nullptr;
-  PLGMPHostQueue m_heliosQueue = nullptr;
   volatile LONG  m_lgmpProcessActive = 0;
 
   PLGMPHostQueue m_pointerQueue = nullptr;
@@ -76,18 +75,12 @@ private:
 
   size_t         m_alignSize    = 0;
   size_t         m_maxFrameSize = 0;
-  size_t         m_maxHeliosFrameSize = 0;
   int            m_frameIndex   = 0;
   uint32_t       m_formatVer    = 0;
   uint32_t       m_frameSerial  = 0;
   PLGMPMemory    m_frameMemory[LGMP_Q_FRAME_LEN] = {};
   KVMFRFrame   * m_frame      [LGMP_Q_FRAME_LEN] = {};
   FrameBuffer  * m_frameBuffer[LGMP_Q_FRAME_LEN] = {};
-  PLGMPMemory    m_heliosMemory[LGMP_Q_HELIOS_LEN] = {};
-  KVMFRFrame   * m_heliosFrame      [LGMP_Q_HELIOS_LEN] = {};
-  FrameBuffer  * m_heliosFrameBuffer[LGMP_Q_HELIOS_LEN] = {};
-  bool           m_heliosFramePending[LGMP_Q_HELIOS_LEN] = {};
-  unsigned       m_heliosFrameIndex = 0;
   CRITICAL_SECTION m_frameLock = {};
   volatile LONG  m_frameDropCount = 0;
 
@@ -174,20 +167,6 @@ public:
   void WriteFrameBuffer(unsigned frameIndex, void* src, size_t offset, size_t len, bool setWritePos) const;
   void FinalizeFrameBuffer(unsigned frameIndex) const;
   void PresentHeliosFrame(unsigned frameIndex);
-
-  struct DirectFrameBuffer
-  {
-    uint32_t status;
-    uint32_t frameIndex;
-    uint32_t frameOffset;
-    uint32_t dataOffset;
-    uint32_t maxSize;
-    uint32_t serial;
-  };
-
-  DirectFrameBuffer AcquireDirectFrame(uint32_t width, uint32_t height, uint32_t pitch, uint32_t frameType);
-  uint32_t CommitDirectFrame(uint32_t frameIndex, uint32_t width, uint32_t height, uint32_t pitch, uint32_t frameType, const void * data, size_t dataSize, const RECT& damage);
-  uint32_t ClearDirectFrame();
 
   void SendCursor(const IDARG_OUT_QUERY_HWCURSOR & info, const BYTE * data);
 
