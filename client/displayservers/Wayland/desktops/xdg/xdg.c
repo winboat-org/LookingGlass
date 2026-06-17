@@ -279,7 +279,21 @@ void xdg_pollWait(struct wl_display * display, int epollFd,
 {
   while (wl_display_prepare_read(display))
     wl_display_dispatch_pending(display);
-  wl_display_flush(display);
+  if (wl_display_flush(display) < 0)
+  {
+    int err = wl_display_get_error(display);
+    if (!err && errno == EAGAIN)
+    {
+      wl_display_cancel_read(display);
+    }
+    else
+    {
+      DEBUG_ERROR("Wayland display flush failed: %s", strerror(err ? err : errno));
+      wl_display_cancel_read(display);
+      app_requestShutdown();
+      return;
+    }
+  }
 
   struct epoll_event events[MAX_EPOLL_EVENTS];
   int count;

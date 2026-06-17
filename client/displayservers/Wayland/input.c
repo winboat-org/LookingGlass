@@ -597,13 +597,13 @@ void waylandWarpPointer(int x, int y, bool exiting)
 {
   if (!wlWm.pointerInSurface || wlWm.lockedPointer ||
       !wlWm.compositor || !wlWm.surface || !wlWm.pointerConstraints ||
-      !wlWm.pointer)
+      !wlWm.pointer || !wlWm.regionSupport)
     return;
 
   INTERLOCKED_SECTION(wlWm.confineLock,
   {
     if (wlWm.lockedPointer || !wlWm.compositor || !wlWm.surface ||
-        !wlWm.pointerConstraints || !wlWm.pointer)
+        !wlWm.pointerConstraints || !wlWm.pointer || !wlWm.regionSupport)
     {
       LG_UNLOCK(wlWm.confineLock);
       return;
@@ -622,6 +622,7 @@ void waylandWarpPointer(int x, int y, bool exiting)
     {
       DEBUG_WARN("failed to create Wayland pointer confinement region");
       wlWm.warpSupport = false;
+      wlWm.regionSupport = false;
       LG_UNLOCK(wlWm.confineLock);
       return;
     }
@@ -659,6 +660,7 @@ void waylandGuestPointerUpdated(double x, double y, double localX, double localY
        !wlWm.compositor       ||
        !wlWm.surface          ||
        !wlWm.pointerConstraints ||
+       !wlWm.regionSupport    ||
         wlWm.lockedPointer    )
     return;
 

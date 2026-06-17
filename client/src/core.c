@@ -477,6 +477,8 @@ void core_handleMouseGrabbed(double ex, double ey)
 
 void core_handleMouseNormal(double ex, double ey)
 {
+  static bool disableKvmfrCursorPos = false;
+
   // prevent cursor handling outside of capture if the position is not known
   if (!g_cursor.guest.valid)
   {
@@ -533,7 +535,8 @@ void core_handleMouseNormal(double ex, double ey)
     struct DoublePoint guest;
     util_localCurToGuest(&guest);
 
-    if (!g_state.stopVideo &&
+    if (!disableKvmfrCursorPos &&
+      !g_state.stopVideo &&
       g_state.kvmfrFeatures & KVMFR_FEATURE_SETCURSORPOS)
     {
       const KVMFRSetCursorPos msg = {
@@ -548,6 +551,12 @@ void core_handleMouseNormal(double ex, double ey)
             &msg, sizeof(msg), &setPosSerial)) != LGMP_OK)
       {
         DEBUG_WARN("Message send failed: %s", lgmpStatusString(status));
+        if (status == LGMP_ERR_QUEUE_TIMEOUT ||
+            status == LGMP_ERR_QUEUE_UNSUBSCRIBED)
+        {
+          DEBUG_WARN("disabling KVMFR cursor realign after pointerQueue send failure");
+          disableKvmfrCursorPos = true;
+        }
         goto fallback;
       }
       else
@@ -581,8 +590,9 @@ void core_handleMouseNormal(double ex, double ey)
           if (--timeout == 0)
           {
             DEBUG_WARN(
-                "pointerQueue serial not updating, expected %u but stuck at %u",
+                "pointerQueue serial not updating, expected %u but stuck at %u, disabling KVMFR cursor realign",
                 setPosSerial, hostSerial);
+            disableKvmfrCursorPos = true;
             g_cursor.realigning = false;
             goto fallback;
           }

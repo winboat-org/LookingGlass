@@ -39,6 +39,7 @@ typedef enum LG_MsgAlert
 LG_MsgAlert;
 
 bool app_isRunning(void);
+void app_requestShutdown(void);
 bool app_inputEnabled(void);
 bool app_isCaptureMode(void);
 bool app_isCaptureOnlyMode(void);

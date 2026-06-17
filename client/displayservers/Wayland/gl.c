@@ -126,10 +126,21 @@ void waylandEGLSwapBuffers(EGLDisplay display, EGLSurface surface, const struct 
       wl_surface_set_buffer_scale(wlWm.surface, waylandScaleFloor(wlWm.scale));
     }
 
-    struct wl_region * region = wl_compositor_create_region(wlWm.compositor);
-    wl_region_add(region, 0, 0, width, height);
-    wl_surface_set_opaque_region(wlWm.surface, region);
-    wl_region_destroy(region);
+    if (wlWm.regionSupport)
+    {
+      struct wl_region * region = wl_compositor_create_region(wlWm.compositor);
+      if (region)
+      {
+        wl_region_add(region, 0, 0, width, height);
+        wl_surface_set_opaque_region(wlWm.surface, region);
+        wl_region_destroy(region);
+      }
+      else
+      {
+        DEBUG_WARN("failed to create Wayland opaque region");
+        wlWm.regionSupport = false;
+      }
+    }
 
     app_handleResizeEvent(width, height, waylandScaleToDouble(wlWm.scale),
         (struct Border) {0, 0, 0, 0});

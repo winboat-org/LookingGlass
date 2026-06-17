@@ -113,6 +113,8 @@ static bool waylandInit(const LG_DSInitParams params)
   if (!wlWm.display)
     return false;
 
+  wlWm.regionSupport = true;
+
   // select the desktop interface based on the compositor process name
   char compositor[1024];
   if (getCompositor(compositor, sizeof(compositor)))
@@ -124,6 +126,9 @@ static bool waylandInit(const LG_DSInitParams params)
         wlWm.desktop = WL_Desktops[i];
         break;
       }
+
+    if (!strcmp(compositor, "Hyprland"))
+      wlWm.regionSupport = false;
   }
   else
     DEBUG_WARN("Compositor: UNKNOWN");
@@ -133,6 +138,11 @@ static bool waylandInit(const LG_DSInitParams params)
 
   wlWm.warpSupport        = option_get_bool("wayland", "warpSupport");
   wlWm.useFractionalScale = option_get_bool("wayland", "fractionScale");
+  if (!wlWm.regionSupport && wlWm.warpSupport)
+  {
+    DEBUG_WARN("Disabling Wayland cursor warp on Hyprland to avoid wl_region disconnects");
+    wlWm.warpSupport = false;
+  }
 
   if (!waylandPollInit())
     return false;

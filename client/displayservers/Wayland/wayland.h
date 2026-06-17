@@ -117,6 +117,7 @@ struct WaylandDSState
   bool needsResize;
   bool configured;
   bool warpSupport;
+  bool regionSupport;
   double cursorX, cursorY;
   double scrollState;
 

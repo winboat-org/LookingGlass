@@ -48,6 +48,11 @@ bool app_isRunning(void)
     g_state.state == APP_STATE_RESTART;
 }
 
+void app_requestShutdown(void)
+{
+  g_state.state = APP_STATE_SHUTDOWN;
+}
+
 bool app_isCaptureMode(void)
 {
   return g_cursor.grab;
