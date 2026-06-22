@@ -179,13 +179,25 @@ void CIndirectDeviceContext::InitAdapter()
 
   m_adapter = initOut.AdapterObject;
 
-  // Try to co-exist with the virtual video device by telling IddCx which
-  // hardware adapter we prefer to render on. Optional registry override:
-  // HKLM\SOFTWARE\LookingGlass\IDD\RenderAdapter = substring of DXGI name.
+  // Render-adapter selection for the IDD compositor.
+  //
+  // Default (HKLM\SOFTWARE\LookingGlass\IDD\HeliosRenderAdapter == 0): force the
+  // IDD onto the software render adapter (Microsoft Basic Render Driver / WARP).
+  // If IddCx chooses by itself it can pick the Helios render adapter, and until
+  // Helios is fully compositable that pulls DWM/Explorer into the experimental UMD
+  // path and can crash-loop the desktop.
+  //
+  // Experimental (HeliosRenderAdapter == 1): select the Helios WDDM render adapter
+  // (PCI\VEN_1AF4&DEV_1050) so the OS composites the desktop ON Helios → venus →
+  // host GPU, and the IDD captures the composed frame via the standard IddCx
+  // swapchain. This is the goal path; gated behind the registry flag so it is
+  // reversible without a rebuild (flip to 0 + reboot, or boot gpu-gl-out to
+  // recover) given the crash-loop risk during bring-up.
+  const bool preferHelios = g_settings.ReadBoolValue(L"HeliosRenderAdapter", false);
+
   IDXGIFactory * factory = NULL;
   IDXGIAdapter * dxgiAdapter;
-  const std::wstring preferredAdapter =
-    g_settings.ReadStringValue(L"RenderAdapter", L"");
+  bool selectedRenderAdapter = false;
   if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void **)&factory)))
   {
     for (UINT i = 0; factory->EnumAdapters(i, &dxgiAdapter) != DXGI_ERROR_NOT_FOUND; ++i)
@@ -194,35 +206,38 @@ void CIndirectDeviceContext::InitAdapter()
       dxgiAdapter->GetDesc(&adapterDesc);
       dxgiAdapter->Release();
 
-      const bool blocked =
-        (adapterDesc.VendorId == 0x1414 && adapterDesc.DeviceId == 0x008c) || // Microsoft Basic Render Driver
-        (adapterDesc.VendorId == 0x1b36 && adapterDesc.DeviceId == 0x000d) || // QXL
-        (adapterDesc.VendorId == 0x1234 && adapterDesc.DeviceId == 0x1111);   // QEMU Standard VGA
-      const bool preferredMismatch =
-        !preferredAdapter.empty() &&
-        wcsstr(adapterDesc.Description, preferredAdapter.c_str()) == nullptr;
+      const bool isBasicRenderDriver =
+        (adapterDesc.VendorId == 0x1414 && adapterDesc.DeviceId == 0x008c) ||
+        wcsstr(adapterDesc.Description, L"Microsoft Basic Render Driver") != nullptr;
+      const bool isHelios = (adapterDesc.VendorId == 0x1af4 && adapterDesc.DeviceId == 0x1050);
 
-      DEBUG_INFO(L"IDD render adapter[%u]: %s vendor=0x%04x device=0x%04x%s%s",
+      const bool wanted = preferHelios ? isHelios : isBasicRenderDriver;
+
+      DEBUG_INFO(L"IDD render adapter[%u]: %s vendor=0x%04x device=0x%04x%s",
         i,
         adapterDesc.Description,
         adapterDesc.VendorId,
         adapterDesc.DeviceId,
-        blocked ? L" blocked" : L"",
-        preferredMismatch ? L" preferred-mismatch" : L"");
+        wanted ? L" selected" : L" skipped");
 
-      if (blocked || preferredMismatch)
+      if (!wanted)
         continue;
 
       IDARG_IN_ADAPTERSETRENDERADAPTER args = {};
       args.PreferredRenderAdapter = adapterDesc.AdapterLuid;
       IddCxAdapterSetRenderAdapter(m_adapter, &args);
-      DEBUG_INFO(L"IDD selected render adapter: %s", adapterDesc.Description);
+      DEBUG_INFO(L"IDD selected render adapter: %s (preferHelios=%d)",
+        adapterDesc.Description, preferHelios ? 1 : 0);
+      selectedRenderAdapter = true;
       break;
     }
     factory->Release();
   }
   else
     DEBUG_WARN("CreateDXGIFactory failed while selecting IDD render adapter");
+
+  if (!selectedRenderAdapter)
+    DEBUG_WARN("Preferred IDD render adapter not found; IddCx render adapter remains OS-selected");
 
   auto * wrapper = WdfObjectGet_CIndirectDeviceContextWrapper(m_adapter);
   wrapper->context = this;  

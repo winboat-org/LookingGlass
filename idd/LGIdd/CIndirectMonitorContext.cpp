@@ -39,25 +39,34 @@ void CIndirectMonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID re
 reInit:
   UnassignSwapChain();
 
+  DEBUG_INFO("AssignSwapChain: renderAdapter LUID=%08x:%08x",
+    (unsigned)renderAdapter.HighPart, (unsigned)renderAdapter.LowPart);
+
   m_dx11Device = std::make_shared<CD3D11Device>(renderAdapter);
-  if (FAILED(m_dx11Device->Init()))
+  HRESULT dx11hr = m_dx11Device->Init();
+  if (FAILED(dx11hr))
   {
+    DEBUG_ERROR_HR(dx11hr, "AssignSwapChain: CD3D11Device::Init FAILED (this gates the whole capture path)");
     WdfObjectDelete(swapChain);
     return;
   }
+  DEBUG_INFO("AssignSwapChain: CD3D11Device::Init OK");
 
   UINT64 alignSize = CPlatformInfo::GetPageSize();
   m_dx12Device = std::make_shared<CD3D12Device>(renderAdapter);
   switch (m_dx12Device->Init(m_devContext->GetIVSHMEM(), alignSize))
   {
     case CD3D12Device::SUCCESS:
+      DEBUG_INFO("AssignSwapChain: CD3D12Device::Init OK");
       break;
 
     case CD3D12Device::FAILURE:
+      DEBUG_ERROR("AssignSwapChain: CD3D12Device::Init FAILURE (D3D12 unavailable on render adapter)");
       WdfObjectDelete(swapChain);
       return;
 
     case CD3D12Device::RETRY:
+      DEBUG_INFO("AssignSwapChain: CD3D12Device::Init RETRY");
       m_dx12Device.reset();
       m_dx11Device.reset();
       goto reInit;
