@@ -45,6 +45,7 @@ private:
   std::shared_ptr<CD3D11Device>   m_dx11Device;
   std::shared_ptr<CD3D12Device>   m_dx12Device;
   HANDLE                          m_newFrameEvent;
+  bool                            m_swapChainDeviceSet = false;
 
   CInteropResourcePool m_resPool;
   CFrameBufferPool     m_fbPool;
@@ -60,10 +61,21 @@ private:
   RECT     m_dirtyRects[LG_MAX_DIRTY_RECTS] = {};
   unsigned m_nbDirtyRects = 0;
   LONG     m_copyBusyDrops = 0;
+  LONG     m_systemFrameCount = 0;
+  LONG     m_systemAcquireFailures = 0;
+
+  /* set when the processor terminates ITSELF (cursor thread topology loss)
+   * rather than being terminated by the destructor — such exits must still
+   * escalate to the monitor lifecycle like any other self-exit */
+  volatile LONG m_selfTerminated = 0;
 
   static DWORD CALLBACK _SwapChainThread(LPVOID arg);
   void SwapChainThread();
-  void SwapChainThreadCore();
+  /* returns true if the loop ended because termination was requested
+   * (destructor / cursor-thread terminate), false on a self-exit (error) —
+   * the caller escalates self-exits to a monitor replug */
+  bool SwapChainThreadCore();
+  HRESULT SetSwapChainDevice();
 
   static DWORD CALLBACK _CursorThread(LPVOID arg);
   bool QueryHWCursor();
@@ -71,12 +83,22 @@ private:
 
   static void CompletionFunction(
     CD3D12CommandQueue * queue, bool result, void * param1, void * param2);
+  HRESULT FinishProcessingFrame(const char * reason);
   bool SwapChainNewFrame(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount);
+  bool SwapChainNewFrameSystem(const IDDCX_SYSTEM_BUFFER_INFO& sysBuffer, unsigned dirtyRectCount);
+  bool SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount, bool frameAlreadyReleased);
 
 public:
   CSwapChainProcessor(IDDCX_MONITOR monitor, CIndirectDeviceContext * devContext, IDDCX_SWAPCHAIN hSwapChain,
     std::shared_ptr<CD3D11Device> dx11Device, std::shared_ptr<CD3D12Device> dx12Device, HANDLE newFrameEvent);
   ~CSwapChainProcessor();
+  HRESULT Start();
+
+  /* Call before destroying the processor when AssignSwapChain returns a
+   * failure status: IddCx retains ownership of the swapchain on failure and
+   * deletes it itself. Only valid while the processing thread has not
+   * started (the thread deletes the handle on exit). */
+  void DisownSwapChain() { m_hSwapChain = nullptr; }
 
   CIndirectDeviceContext * GetDevice() { return m_devContext; }
   std::shared_ptr<CD3D12Device> GetD3D12Device() { return m_dx12Device; }

@@ -34,9 +34,12 @@ private:
   LUID m_adapterLuid;
   ComPtr<IDXGIFactory5       > m_factory;
   ComPtr<IDXGIAdapter1       > m_adapter;
-  ComPtr<ID3D11Device5       > m_device;
-  ComPtr<ID3D11DeviceContext4> m_context;
-  bool m_isSoftware;
+  ComPtr<ID3D11Device        > m_device;
+  ComPtr<ID3D11DeviceContext > m_context;
+  ComPtr<ID3D11Device5       > m_device5;
+  ComPtr<ID3D11DeviceContext4> m_context4;
+  bool m_isSoftware = false;
+  D3D_FEATURE_LEVEL m_featureLevel = D3D_FEATURE_LEVEL_9_1;
 
 public:
   CD3D11Device(LUID adapterLuid) :
@@ -49,9 +52,15 @@ public:
 
   HRESULT Init();
 
-  ComPtr<ID3D11Device5> GetDevice() { return m_device; }
+  ComPtr<ID3D11Device> GetBaseDevice() { return m_device; }
 
-  ComPtr<ID3D11DeviceContext4> GetContext() { return m_context; }
+  ComPtr<ID3D11DeviceContext> GetBaseContext() { return m_context; }
+
+  ComPtr<ID3D11Device5> GetDevice() { return m_device5; }
+
+  ComPtr<ID3D11DeviceContext4> GetContext() { return m_context4; }
+
+  D3D_FEATURE_LEVEL GetFeatureLevel() { return m_featureLevel; }
 
   bool IsSoftware() { return m_isSoftware; }
 };

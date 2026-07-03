@@ -28,7 +28,7 @@
 
 class CFrameBufferPool
 {
-  CSwapChainProcessor * m_swapChain;
+  CSwapChainProcessor * m_swapChain = nullptr;
 
   CFrameBufferResource m_buffers[LGMP_Q_FRAME_LEN];
 

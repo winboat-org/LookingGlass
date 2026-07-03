@@ -33,13 +33,15 @@ CSwapChainProcessor::CSwapChainProcessor(IDDCX_MONITOR monitor, CIndirectDeviceC
   m_dx12Device(dx12Device),
   m_newFrameEvent(newFrameEvent)
 {
-  m_resPool.Init(dx11Device, dx12Device);
-  m_fbPool.Init(this);
-  if (!m_postProcessor.Init(dx12Device))
-    DEBUG_ERROR("Failed to initialize post processor");
+  if (dx12Device)
+  {
+    m_resPool.Init(dx11Device, dx12Device);
+    m_fbPool.Init(this);
+    if (!m_postProcessor.Init(dx12Device))
+      DEBUG_ERROR("Failed to initialize post processor");
+  }
 
   m_terminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
-  m_thread[0].Attach(CreateThread(nullptr, 0, _SwapChainThread, this, 0, nullptr));
 
   m_cursorDataEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
   m_shapeBuffer = new BYTE[512 * 512 * 4];
@@ -53,9 +55,20 @@ CSwapChainProcessor::~CSwapChainProcessor()
   if (m_thread[1].Get())
     WaitForSingleObject(m_thread[1].Get(), INFINITE);
 
-  m_postProcessor.Reset();
-  m_resPool.Reset();
-  m_fbPool.Reset();
+  /* IDDCX_SWAPCHAIN ownership: the driver owns the handle only if
+   * EvtIddCxMonitorAssignSwapChain returned success; the processing thread
+   * deletes it on exit (and clears m_hSwapChain), and the join above makes
+   * that visible here. If Start() failed, AssignSwapChain returns
+   * ABANDON_SWAPCHAIN and calls DisownSwapChain() first, because on a failure
+   * return IddCx deletes the swapchain itself -- deleting it here as well
+   * double-deletes the FxObject and crashes WUDFHost (Code 43). */
+
+  if (m_dx12Device)
+  {
+    m_postProcessor.Reset();
+    m_resPool.Reset();
+    m_fbPool.Reset();
+  }
   delete[] m_shapeBuffer;
 }
 
@@ -65,31 +78,64 @@ DWORD CALLBACK CSwapChainProcessor::_SwapChainThread(LPVOID arg)
   return 0;
 }
 
+HRESULT CSwapChainProcessor::Start()
+{
+  HRESULT hr = SetSwapChainDevice();
+  if (FAILED(hr))
+  {
+    /* On the Helios pairing the FIRST swapchain of a boot arrives already
+     * abandoned (it was created against the initial render/indirect pairing
+     * instance, which dxgkrnl removes and re-creates during bring-up — the
+     * LUID churn — while DWM produces into the replacement swapchain).
+     * Verified 2026-07-02: DWM's presents complete through the blt queue at
+     * the same moment SetDevice fails ACCESS_LOST on the handed-in swapchain,
+     * and running the acquire loop on it anyway never yields a frame.
+     * Fail Start() so AssignSwapChain returns ABANDON_SWAPCHAIN: per the
+     * IddCx contract the OS then creates a NEW swapchain and calls
+     * AssignSwapChain again, which is the only path that can hand us the
+     * live instance. */
+    return hr;
+  }
+
+  m_thread[0].Attach(CreateThread(nullptr, 0, _SwapChainThread, this, 0, nullptr));
+  if (!m_thread[0].Get())
+    return HRESULT_FROM_WIN32(GetLastError());
+  return S_OK;
+}
+
 void CSwapChainProcessor::SwapChainThread()
 {
   DWORD  avTask       = 0;
   HANDLE avTaskHandle = AvSetMmThreadCharacteristicsW(L"Distribution", &avTask);
 
   DEBUG_INFO("Start Thread");
-  SwapChainThreadCore();
+  const bool terminated = SwapChainThreadCore();
 
   WdfObjectDelete((WDFOBJECT)m_hSwapChain);
   m_hSwapChain = nullptr;
 
   AvRevertMmThreadCharacteristics(avTaskHandle);
+
+  /* the loop died on its own (device set failure, acquire failure, cursor
+   * setup failure, cursor-thread topology loss, ...) with no unassign from
+   * the OS — without escalation the acquire loop is simply gone and the
+   * display sits frameless forever. Queue a monitor replug (picked up by
+   * the LGMP timer / watchdog). */
+  if (!terminated || InterlockedCompareExchange(&m_selfTerminated, 0, 0))
+    m_devContext->NotifySwapChainSelfExit();
 }
 
-void CSwapChainProcessor::SwapChainThreadCore()
+HRESULT CSwapChainProcessor::SetSwapChainDevice()
 {
   ComPtr<IDXGIDevice> dxgiDevice;
-  HRESULT hr = m_dx11Device->GetDevice().As(&dxgiDevice);
+  HRESULT hr = m_dx11Device->GetBaseDevice().As(&dxgiDevice);
   if (FAILED(hr))
   {
     DEBUG_ERROR_HR(hr, "Failed to get the dxgiDevice");
-    return;
+    return hr;
   }
 
-  if (IDD_IS_FUNCTION_AVAILABLE(IddCxSetRealtimeGPUPriority))
+  if (m_dx12Device && IDD_IS_FUNCTION_AVAILABLE(IddCxSetRealtimeGPUPriority))
   {
     DEBUG_INFO("Using IddCxSetRealtimeGPUPriority");
     IDARG_IN_SETREALTIMEGPUPRIORITY arg = {0};
@@ -107,11 +153,56 @@ void CSwapChainProcessor::SwapChainThreadCore()
   IDARG_IN_SWAPCHAINSETDEVICE setDevice = {};
   setDevice.pDevice = dxgiDevice.Get();
 
-  hr = IddCxSwapChainSetDevice(m_hSwapChain, &setDevice);
+  for (UINT attempt = 0; attempt < 5; ++attempt)
+  {
+    hr = IddCxSwapChainSetDevice(m_hSwapChain, &setDevice);
+    if (SUCCEEDED(hr))
+      break;
+
+    DEBUG_WARN_HR(hr, "IddCxSwapChainSetDevice attempt %u failed", attempt + 1);
+    if (hr != DXGI_ERROR_ACCESS_LOST)
+      break;
+
+    Sleep(100);
+  }
   if (FAILED(hr))
   {
     DEBUG_ERROR_HR(hr, "IddCxSwapChainSetDevice Failed");
-    return;
+    return hr;
+  }
+
+  m_swapChainDeviceSet = true;
+  return S_OK;
+}
+
+bool CSwapChainProcessor::SwapChainThreadCore()
+{
+  HRESULT hr = S_OK;
+
+  if (!m_swapChainDeviceSet)
+  {
+    hr = SetSwapChainDevice();
+    if (FAILED(hr))
+    {
+      /* an acquire loop with no bound device spins framelessly forever —
+       * exit instead; the self-exit path escalates to a monitor replug */
+      DEBUG_ERROR_HR(hr, "SetSwapChainDevice still failing on the swapchain thread; "
+                         "exiting so the monitor lifecycle can replug");
+      return false;
+    }
+  }
+
+  BOOL swapChainInSystemMemory = FALSE;
+  if (!m_dx12Device)
+  {
+    hr = IddCxSwapChainInSystemMemory(m_hSwapChain, &swapChainInSystemMemory);
+    if (FAILED(hr))
+    {
+      DEBUG_WARN_HR(hr, "IddCxSwapChainInSystemMemory failed; using D3D11 staging path");
+      swapChainInSystemMemory = FALSE;
+    }
+    DEBUG_INFO("IddCx swapchain in system memory: %u", swapChainInSystemMemory);
+    DEBUG_INFO("Using %s swapchain path", swapChainInSystemMemory ? "IddCx system-buffer" : "D3D11 staging");
   }
 
   IDARG_IN_SETUP_HWCURSOR c = {};
@@ -125,7 +216,7 @@ void CSwapChainProcessor::SwapChainThreadCore()
   if (!NT_SUCCESS(status))
   {
     DEBUG_ERROR("IddCxMonitorSetupHardwareCursor Failed (0x%08x)", status);
-    return;
+    return false;
   }
 
   m_lastShapeId = 0;
@@ -136,18 +227,66 @@ void CSwapChainProcessor::SwapChainThreadCore()
   g_pipe.SetGPUStatus(m_dx11Device->IsSoftware());
 
   UINT lastFrameNumber = 0;
+  UINT pendingPolls = 0;
+  bool terminated = false;
   for (;;)
   {
     if (WaitForSingleObject(m_terminateEvent.Get(), 0) == WAIT_OBJECT_0)
+    {
+      terminated = true;
       break;
+    }
 
     UINT frameNumber = 0;
     UINT dirtyRectCount = 0;
     ComPtr<IDXGIResource> surface;
+    IDDCX_SYSTEM_BUFFER_INFO sysBuffer = {};
+    bool useSystemBuffer = false;
 
 #if defined(IDDCX_VERSION_MAJOR) && defined(IDDCX_VERSION_MINOR) && \
   (IDDCX_VERSION_MAJOR > 1 || (IDDCX_VERSION_MAJOR == 1 && IDDCX_VERSION_MINOR >= 10))
-    if (m_devContext->CanProcessFP16())
+    if (!m_dx12Device)
+    {
+      if (swapChainInSystemMemory)
+      {
+        IDDCX_METADATA meta = {};
+        meta.Size = sizeof(meta);
+        sysBuffer.Size = sizeof(sysBuffer);
+
+        IDARG_OUT_RELEASEANDACQUIRESYSTEMBUFFER buffer = {};
+        buffer.pMetaData = &meta;
+        buffer.pBufferInfo = &sysBuffer;
+
+        hr = IddCxSwapChainReleaseAndAcquireSystemBuffer(m_hSwapChain, &buffer);
+        if (hr != E_PENDING)
+          DEBUG_INFO("IddCx system acquire returned hr=0x%08x frame=%u dirty=%u buffer=%p pitch=%u",
+            hr, meta.PresentationFrameNumber, meta.DirtyRectCount,
+            sysBuffer.pBuffer, sysBuffer.Pitch);
+        if (SUCCEEDED(hr))
+        {
+          frameNumber = meta.PresentationFrameNumber;
+          dirtyRectCount = meta.DirtyRectCount;
+          useSystemBuffer = true;
+        }
+      }
+      else
+      {
+        IDARG_OUT_RELEASEANDACQUIREBUFFER buffer = {};
+
+        hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &buffer);
+        if (hr != E_PENDING)
+          DEBUG_INFO("IddCx acquire returned hr=0x%08x frame=%u dirty=%u surface=%p",
+            hr, buffer.MetaData.PresentationFrameNumber,
+            buffer.MetaData.DirtyRectCount, buffer.MetaData.pSurface);
+        if (SUCCEEDED(hr))
+        {
+          frameNumber = buffer.MetaData.PresentationFrameNumber;
+          dirtyRectCount = buffer.MetaData.DirtyRectCount;
+          surface.Attach(buffer.MetaData.pSurface);
+        }
+      }
+    }
+    else if (m_devContext->CanProcessFP16())
     {
       IDARG_IN_RELEASEANDACQUIREBUFFER2 acquireIn = {};
       acquireIn.Size = sizeof(acquireIn);
@@ -157,11 +296,15 @@ void CSwapChainProcessor::SwapChainThreadCore()
       buffer.MetaData.Size = sizeof(buffer.MetaData);
 
       hr = IddCxSwapChainReleaseAndAcquireBuffer2(m_hSwapChain, &acquireIn, &buffer);
+      if (hr != E_PENDING)
+        DEBUG_INFO("IddCx acquire2 returned hr=0x%08x frame=%u dirty=%u surface=%p",
+          hr, buffer.MetaData.PresentationFrameNumber,
+          buffer.MetaData.DirtyRectCount, buffer.MetaData.pSurface);
       if (SUCCEEDED(hr))
       {
         frameNumber = buffer.MetaData.PresentationFrameNumber;
         dirtyRectCount = buffer.MetaData.DirtyRectCount;
-        surface = buffer.MetaData.pSurface;
+        surface.Attach(buffer.MetaData.pSurface);
       }
     }
     else
@@ -170,16 +313,24 @@ void CSwapChainProcessor::SwapChainThreadCore()
       IDARG_OUT_RELEASEANDACQUIREBUFFER buffer = {};
 
       hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &buffer);
+      if (hr != E_PENDING)
+        DEBUG_INFO("IddCx acquire legacy returned hr=0x%08x frame=%u dirty=%u surface=%p",
+          hr, buffer.MetaData.PresentationFrameNumber,
+          buffer.MetaData.DirtyRectCount, buffer.MetaData.pSurface);
       if (SUCCEEDED(hr))
       {
         frameNumber = buffer.MetaData.PresentationFrameNumber;
         dirtyRectCount = buffer.MetaData.DirtyRectCount;
-        surface = buffer.MetaData.pSurface;
+        surface.Attach(buffer.MetaData.pSurface);
       }
     }
 
     if (hr == E_PENDING)
     {
+      if (!m_dx12Device && (++pendingPolls == 1 || (pendingPolls % 300) == 0))
+        DEBUG_INFO("IddCx swapchain pending (polls=%u, systemMemory=%u, legacyAcquire=1)",
+          pendingPolls, swapChainInSystemMemory);
+
       HANDLE waitHandles[] =
       {
         m_newFrameEvent,
@@ -189,7 +340,10 @@ void CSwapChainProcessor::SwapChainThreadCore()
       if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT)
         continue;
       else if (waitResult == WAIT_OBJECT_0 + 1)
+      {
+        terminated = true;
         break;
+      }
       else
       {
         hr = HRESULT_FROM_WIN32(waitResult);
@@ -198,31 +352,79 @@ void CSwapChainProcessor::SwapChainThreadCore()
     }
     else if (SUCCEEDED(hr))
     {
-      if (frameNumber != lastFrameNumber)
+      bool frameAlreadyFinished = false;
+      pendingPolls = 0;
+      /* disarm the first-frame (stale-binding) watchdog for this binding */
+      m_devContext->NotifyFrameAcquired();
+      if (!m_dx12Device && !useSystemBuffer)
       {
-        lastFrameNumber = frameNumber;
-        SwapChainNewFrame(surface, dirtyRectCount);
-
-        // report that all GPU processing for this frame has been queued
-        hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
+        hr = FinishProcessingFrame("d3d11-acquired-immediate");
         if (FAILED(hr))
         {
           if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
             m_devContext->OnSwapChainLost();
-          else
-            DEBUG_ERROR_HR(hr, "IddCxSwapChainFinishedProcessingFrame Failed");
           break;
         }
+        frameAlreadyFinished = true;
+      }
+      if (frameNumber != lastFrameNumber)
+      {
+        lastFrameNumber = frameNumber;
+        if (useSystemBuffer)
+          SwapChainNewFrameSystem(sysBuffer, dirtyRectCount);
+        else if (!m_dx12Device)
+        {
+          DEBUG_TRACE("D3D11 fallback acquired frame=%u dirty=%u surface=%p",
+            frameNumber, dirtyRectCount, surface.Get());
+          SwapChainNewFrameD3D11(surface, dirtyRectCount, true);
+          surface.Reset();
+        }
+        else
+          SwapChainNewFrame(surface, dirtyRectCount);
+      }
 
+      // report that all GPU processing for this frame has been queued
+      if (!frameAlreadyFinished)
+      {
+        hr = FinishProcessingFrame("main-loop");
+        if (FAILED(hr))
+        {
+          if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
+            m_devContext->OnSwapChainLost();
+          break;
+        }
       }
     }
     else
     {
+      if (!m_dx12Device)
+      {
+        const LONG failures = InterlockedIncrement(&m_systemAcquireFailures);
+        if (failures == 1 || (failures % 60) == 0)
+          DEBUG_WARN_HR(hr, "IddCx swapchain acquire failed (failures=%ld, systemMemory=%u, legacyAcquire=1)",
+            failures, swapChainInSystemMemory);
+
+      }
+
       if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
         m_devContext->OnSwapChainLost();
+      else if (hr == DXGI_ERROR_ACCESS_LOST)
+        m_devContext->OnSwapChainDeviceLost();
       break;
     }
   }
+
+  return terminated;
+}
+
+HRESULT CSwapChainProcessor::FinishProcessingFrame(const char * reason)
+{
+  HRESULT hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
+  if (FAILED(hr))
+    DEBUG_ERROR_HR(hr, "IddCxSwapChainFinishedProcessingFrame Failed (%s)", reason);
+  else
+    DEBUG_TRACE("IddCxSwapChainFinishedProcessingFrame OK (%s)", reason);
+  return hr;
 }
 
 void CSwapChainProcessor::CompletionFunction(
@@ -314,6 +516,290 @@ static FrameType GetFrameType(DXGI_FORMAT format)
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return FRAME_TYPE_RGBA16F;
     default                            : return FRAME_TYPE_INVALID;
   }
+}
+
+bool CSwapChainProcessor::SwapChainNewFrameSystem(const IDDCX_SYSTEM_BUFFER_INFO& sysBuffer, unsigned dirtyRectCount)
+{
+  if (!sysBuffer.pBuffer || sysBuffer.Pitch == 0 || sysBuffer.Width == 0 || sysBuffer.Height == 0)
+  {
+    DEBUG_ERROR("Invalid IddCx system buffer");
+    return false;
+  }
+
+  FrameType frameType = GetFrameType(sysBuffer.Format);
+  if (frameType == FRAME_TYPE_INVALID)
+  {
+    DEBUG_ERROR("Unsupported system-buffer frame format 0x%x", sysBuffer.Format);
+    return false;
+  }
+
+  D12FrameFormat frameFormat = {};
+  frameFormat.desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  frameFormat.desc.Width = sysBuffer.Width;
+  frameFormat.desc.Height = sysBuffer.Height;
+  frameFormat.desc.DepthOrArraySize = 1;
+  frameFormat.desc.MipLevels = 1;
+  frameFormat.desc.Format = sysBuffer.Format;
+  frameFormat.desc.SampleDesc.Count = 1;
+  frameFormat.width = sysBuffer.Width;
+  frameFormat.height = sysBuffer.Height;
+  frameFormat.format = frameType;
+  frameFormat.hdr = sysBuffer.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  frameFormat.hdrPQ = false;
+
+  RECT dirtyRects[LG_MAX_DIRTY_RECTS] = {};
+  unsigned nbDirtyRects = dirtyRectCount;
+  if (nbDirtyRects == 0 || nbDirtyRects > ARRAYSIZE(dirtyRects) || m_nbDirtyRects == 0)
+  {
+    dirtyRects[0].left = 0;
+    dirtyRects[0].top = 0;
+    dirtyRects[0].right = static_cast<LONG>(sysBuffer.Width);
+    dirtyRects[0].bottom = static_cast<LONG>(sysBuffer.Height);
+    nbDirtyRects = 1;
+  }
+  else
+  {
+    IDARG_IN_GETDIRTYRECTS dirtyIn = {};
+    dirtyIn.DirtyRectInCount = nbDirtyRects;
+    dirtyIn.pDirtyRects = dirtyRects;
+
+    IDARG_OUT_GETDIRTYRECTS dirtyOut = {};
+    HRESULT hr = IddCxSwapChainGetDirtyRects(m_hSwapChain, &dirtyIn, &dirtyOut);
+    if (FAILED(hr))
+    {
+      DEBUG_ERROR_HR(hr, "IddCxSwapChainGetDirtyRects Failed");
+      dirtyRects[0].left = 0;
+      dirtyRects[0].top = 0;
+      dirtyRects[0].right = static_cast<LONG>(sysBuffer.Width);
+      dirtyRects[0].bottom = static_cast<LONG>(sysBuffer.Height);
+      nbDirtyRects = 1;
+    }
+    else
+      nbDirtyRects = dirtyOut.DirtyRectOutCount;
+  }
+  ClipDirtyRects(dirtyRects, &nbDirtyRects, frameFormat.desc);
+
+  auto buffer = m_devContext->PrepareFrameBuffer(sysBuffer.Pitch, frameFormat, frameFormat, dirtyRects, nbDirtyRects);
+  if (!buffer.mem)
+    return false;
+
+  const size_t bpp = frameType == FRAME_TYPE_RGBA16F ? 8 : 4;
+  const size_t srcRowBytes = (size_t)sysBuffer.Width * bpp;
+  const size_t rowBytes = srcRowBytes < sysBuffer.Pitch ? srcRowBytes : sysBuffer.Pitch;
+  size_t rows = sysBuffer.Height < buffer.height ? sysBuffer.Height : buffer.height;
+
+  const uint8_t * src = static_cast<const uint8_t *>(sysBuffer.pBuffer);
+  uint8_t * dst = buffer.mem;
+  for (size_t row = 0; row < rows; ++row)
+  {
+    const size_t copyBytes = rowBytes < buffer.pitch ? rowBytes : buffer.pitch;
+    memcpy(dst + row * buffer.pitch, src + row * sysBuffer.Pitch, copyBytes);
+    if (buffer.pitch > copyBytes)
+      memset(dst + row * buffer.pitch + copyBytes, 0, buffer.pitch - copyBytes);
+  }
+
+  m_devContext->FinalizeFrameBuffer(buffer.frameIndex, rows * buffer.pitch);
+  m_devContext->PresentHeliosFrame(buffer.frameIndex);
+  memcpy(m_dirtyRects, dirtyRects, nbDirtyRects * sizeof(*m_dirtyRects));
+  m_nbDirtyRects = nbDirtyRects;
+
+  const LONG frames = InterlockedIncrement(&m_systemFrameCount);
+  if (frames == 1 || (frames % 120) == 0)
+    DEBUG_INFO("System-buffer frame %ld: %ux%u srcPitch=%u dstPitch=%u format=0x%x dirty=%u rows=%llu rowBytes=%llu",
+      frames, sysBuffer.Width, sysBuffer.Height, sysBuffer.Pitch, buffer.pitch,
+      sysBuffer.Format, nbDirtyRects, (unsigned long long)rows, (unsigned long long)rowBytes);
+
+  return true;
+}
+
+bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount, bool frameAlreadyReleased)
+{
+  bool finished = frameAlreadyReleased;
+  auto finishAcquiredFrame = [&](const char * reason) -> bool
+  {
+    if (finished)
+      return true;
+    HRESULT finishHr = FinishProcessingFrame(reason);
+    finished = SUCCEEDED(finishHr);
+    return finished;
+  };
+
+  if (!acquiredBuffer)
+  {
+    DEBUG_ERROR("D3D11 fallback acquired a null buffer");
+    finishAcquiredFrame("d3d11-null-buffer");
+    return false;
+  }
+
+  ComPtr<ID3D11Texture2D> texture;
+  DEBUG_TRACE("D3D11 fallback: As(ID3D11Texture2D)");
+  HRESULT hr = acquiredBuffer.As(&texture);
+  if (FAILED(hr))
+  {
+    DEBUG_ERROR_HR(hr, "Failed to obtain the ID3D11Texture2D from the acquiredBuffer");
+    finishAcquiredFrame("d3d11-as-failed");
+    return false;
+  }
+
+  D3D11_TEXTURE2D_DESC desc = {};
+  texture->GetDesc(&desc);
+  DEBUG_INFO("D3D11 fallback frame: %ux%u format=0x%x sample=%u/%u dirty=%u",
+    desc.Width, desc.Height, desc.Format, desc.SampleDesc.Count,
+    desc.SampleDesc.Quality, dirtyRectCount);
+
+  FrameType frameType = GetFrameType(desc.Format);
+  if (frameType == FRAME_TYPE_INVALID)
+  {
+    DEBUG_ERROR("Unsupported D3D11 fallback frame format 0x%x", desc.Format);
+    finishAcquiredFrame("d3d11-bad-format");
+    return false;
+  }
+
+  D12FrameFormat frameFormat = {};
+  frameFormat.desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  frameFormat.desc.Width = desc.Width;
+  frameFormat.desc.Height = desc.Height;
+  frameFormat.desc.DepthOrArraySize = 1;
+  frameFormat.desc.MipLevels = 1;
+  frameFormat.desc.Format = desc.Format;
+  frameFormat.desc.SampleDesc.Count = desc.SampleDesc.Count;
+  frameFormat.desc.SampleDesc.Quality = desc.SampleDesc.Quality;
+  frameFormat.width = desc.Width;
+  frameFormat.height = desc.Height;
+  frameFormat.format = frameType;
+  frameFormat.hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  frameFormat.hdrPQ = false;
+
+  RECT dirtyRects[LG_MAX_DIRTY_RECTS] = {};
+  unsigned nbDirtyRects = dirtyRectCount;
+  if (nbDirtyRects == 0 || nbDirtyRects > ARRAYSIZE(dirtyRects) || m_nbDirtyRects == 0)
+  {
+    dirtyRects[0].left = 0;
+    dirtyRects[0].top = 0;
+    dirtyRects[0].right = static_cast<LONG>(desc.Width);
+    dirtyRects[0].bottom = static_cast<LONG>(desc.Height);
+    nbDirtyRects = 1;
+  }
+  else
+  {
+    IDARG_IN_GETDIRTYRECTS dirtyIn = {};
+    dirtyIn.DirtyRectInCount = nbDirtyRects;
+    dirtyIn.pDirtyRects = dirtyRects;
+
+    IDARG_OUT_GETDIRTYRECTS dirtyOut = {};
+    hr = IddCxSwapChainGetDirtyRects(m_hSwapChain, &dirtyIn, &dirtyOut);
+    if (FAILED(hr))
+    {
+      DEBUG_ERROR_HR(hr, "IddCxSwapChainGetDirtyRects Failed");
+      dirtyRects[0].left = 0;
+      dirtyRects[0].top = 0;
+      dirtyRects[0].right = static_cast<LONG>(desc.Width);
+      dirtyRects[0].bottom = static_cast<LONG>(desc.Height);
+      nbDirtyRects = 1;
+    }
+    else
+      nbDirtyRects = dirtyOut.DirtyRectOutCount;
+  }
+  ClipDirtyRects(dirtyRects, &nbDirtyRects, frameFormat.desc);
+
+  D3D11_TEXTURE2D_DESC stagingDesc = desc;
+  stagingDesc.BindFlags = 0;
+  stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  stagingDesc.MiscFlags = 0;
+  stagingDesc.Usage = D3D11_USAGE_STAGING;
+
+  ComPtr<ID3D11Texture2D> staging;
+  DEBUG_TRACE("D3D11 fallback: CreateTexture2D staging");
+  hr = m_dx11Device->GetBaseDevice()->CreateTexture2D(&stagingDesc, nullptr, &staging);
+  if (FAILED(hr))
+  {
+    DEBUG_ERROR_HR(hr, "Failed to create D3D11 staging texture");
+    finishAcquiredFrame("d3d11-create-staging-failed");
+    return false;
+  }
+
+  auto context = m_dx11Device->GetBaseContext();
+  DEBUG_TRACE("D3D11 fallback: CopyResource staging<-swapchain");
+  context->CopyResource(staging.Get(), texture.Get());
+  if (!finishAcquiredFrame("d3d11-staging-copy-submitted"))
+    return false;
+
+  acquiredBuffer.Reset();
+  texture.Reset();
+
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  DEBUG_TRACE("D3D11 fallback: Map staging");
+  hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+  {
+    DEBUG_ERROR_HR(hr, "Failed to map D3D11 staging texture");
+    return false;
+  }
+
+  auto buffer = m_devContext->PrepareFrameBuffer(mapped.RowPitch, frameFormat, frameFormat, dirtyRects, nbDirtyRects);
+  if (!buffer.mem)
+  {
+    DEBUG_ERROR("Failed to prepare D3D11 fallback frame buffer");
+    context->Unmap(staging.Get(), 0);
+    return false;
+  }
+
+  const size_t bpp = frameType == FRAME_TYPE_RGBA16F ? 8 : 4;
+  const size_t srcRowBytes = (size_t)desc.Width * bpp;
+  const size_t rowBytes = srcRowBytes < mapped.RowPitch ? srcRowBytes : mapped.RowPitch;
+  size_t rows = desc.Height < buffer.height ? desc.Height : buffer.height;
+
+  const uint8_t * src = static_cast<const uint8_t *>(mapped.pData);
+  uint8_t * dst = buffer.mem;
+  uint64_t sampleHash = 1469598103934665603ull;
+  uint32_t sampleNonZero = 0;
+  uint32_t sampleBytes = 0;
+  uint32_t firstPixel = 0;
+  uint32_t centerPixel = 0;
+  if (rows > 0 && rowBytes >= 4)
+  {
+    memcpy(&firstPixel, src, sizeof(firstPixel));
+    const size_t centerRow = rows / 2;
+    const size_t centerCol = (rowBytes / bpp) / 2;
+    memcpy(&centerPixel,
+      src + centerRow * mapped.RowPitch + centerCol * bpp,
+      sizeof(centerPixel));
+  }
+  for (size_t row = 0; row < rows; ++row)
+  {
+    const size_t copyBytes = rowBytes < buffer.pitch ? rowBytes : buffer.pitch;
+    memcpy(dst + row * buffer.pitch, src + row * mapped.RowPitch, copyBytes);
+    if (row == 0 || row == rows / 2 || row + 1 == rows)
+    {
+      const uint8_t * sample = src + row * mapped.RowPitch;
+      for (size_t i = 0; i < copyBytes; i += 64)
+      {
+        const uint8_t v = sample[i];
+        sampleNonZero += v != 0;
+        sampleHash ^= v;
+        sampleHash *= 1099511628211ull;
+        ++sampleBytes;
+      }
+    }
+    if (buffer.pitch > copyBytes)
+      memset(dst + row * buffer.pitch + copyBytes, 0, buffer.pitch - copyBytes);
+  }
+  context->Unmap(staging.Get(), 0);
+
+  m_devContext->FinalizeFrameBuffer(buffer.frameIndex, rows * buffer.pitch);
+  m_devContext->PresentHeliosFrame(buffer.frameIndex);
+  memcpy(m_dirtyRects, dirtyRects, nbDirtyRects * sizeof(*m_dirtyRects));
+  m_nbDirtyRects = nbDirtyRects;
+
+  const LONG frames = InterlockedIncrement(&m_systemFrameCount);
+  if (frames == 1 || (frames % 30) == 0)
+    DEBUG_INFO("D3D11 fallback frame %ld: %ux%u srcPitch=%u dstPitch=%u format=0x%x dirty=%u rows=%llu rowBytes=%llu first=0x%08x center=0x%08x sampleNonZero=%u/%u sampleHash=0x%llx",
+      frames, desc.Width, desc.Height, mapped.RowPitch, buffer.pitch,
+      desc.Format, nbDirtyRects, (unsigned long long)rows, (unsigned long long)rowBytes,
+      firstPixel, centerPixel, sampleNonZero, sampleBytes,
+      (unsigned long long)sampleHash);
+
+  return true;
 }
 
 bool CSwapChainProcessor::SwapChainNewFrame(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount)
@@ -539,6 +1025,10 @@ bool CSwapChainProcessor::QueryHWCursor()
     if (status == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
     {
       m_devContext->OnSwapChainLost();
+      /* self-initiated terminate: the main loop will see the terminate event
+       * and exit "normally", but this is a self-exit and must escalate to
+       * the monitor lifecycle (see SwapChainThread) */
+      InterlockedExchange(&m_selfTerminated, 1);
       SetEvent(m_terminateEvent.Get());
       return false;
     }

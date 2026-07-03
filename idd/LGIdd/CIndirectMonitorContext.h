@@ -46,7 +46,7 @@ public:
 
   virtual ~CIndirectMonitorContext();
   
-  void AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
+  NTSTATUS AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
   void UnassignSwapChain();
 
   CIndirectDeviceContext * GetDeviceContext() { return m_devContext; }

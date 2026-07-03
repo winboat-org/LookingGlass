@@ -27,6 +27,14 @@ HRESULT CD3D11Device::Init()
   if (FAILED(hr))
     return hr;
 
+  static const D3D_FEATURE_LEVEL featureLevels[] =
+  {
+    D3D_FEATURE_LEVEL_11_1,
+    D3D_FEATURE_LEVEL_11_0,
+    D3D_FEATURE_LEVEL_10_1,
+    D3D_FEATURE_LEVEL_10_0
+  };
+
   hr = m_factory->EnumAdapterByLuid(m_adapterLuid, IID_PPV_ARGS(&m_adapter));
   if (FAILED(hr))
     return hr;
@@ -37,16 +45,8 @@ HRESULT CD3D11Device::Init()
     return hr;
 
   m_isSoftware = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
-  
-  // only 11.1 supports DX12 interoperabillity
-  static const D3D_FEATURE_LEVEL featureLevels[] =
-  {
-    D3D_FEATURE_LEVEL_11_1
-  };
-  D3D_FEATURE_LEVEL featureLevel;
 
-  ComPtr<ID3D11Device> device;
-  ComPtr<ID3D11DeviceContext> context;
+  DEBUG_INFO("D3D11CreateDevice: begin flags=BGRA featureLevels=11_1,11_0,10_1,10_0");
   hr = D3D11CreateDevice(
     m_adapter.Get(),
     D3D_DRIVER_TYPE_UNKNOWN,
@@ -55,21 +55,24 @@ HRESULT CD3D11Device::Init()
     featureLevels,
     ARRAYSIZE(featureLevels),
     D3D11_SDK_VERSION,
-    &device,
-    &featureLevel,
-    &context);
+    &m_device,
+    &m_featureLevel,
+    &m_context);
   if (FAILED(hr))
+  {
+    DEBUG_ERROR_HR(hr, "D3D11CreateDevice failed");
     return hr;
+  }
 
-  DEBUG_INFO("Feature Level: 0x%x", featureLevel);
+  DEBUG_INFO("Feature Level: 0x%x", m_featureLevel);
 
-  hr = device.As(&m_device);
+  hr = m_device.As(&m_device5);
   if (FAILED(hr))
-    return hr;
+    DEBUG_INFO("ID3D11Device5 unavailable; using base ID3D11Device path (0x%08x)", hr);
 
-  hr = context.As(&m_context);
+  hr = m_context.As(&m_context4);
   if (FAILED(hr))
-    return hr;
+    DEBUG_INFO("ID3D11DeviceContext4 unavailable; using base ID3D11DeviceContext path (0x%08x)", hr);
 
   return S_OK;
 }

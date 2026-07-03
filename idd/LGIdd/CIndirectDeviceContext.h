@@ -50,11 +50,47 @@ struct FrameBuffer
 
 class CIndirectDeviceContext
 {
+public:
+  /* C5 monitor-lifecycle state machine.
+   *
+   * IddCx drivers own their monitor lifecycle: the OS is free to abandon and
+   * re-create swapchains and re-pair render adapters at any time, and a
+   * correct driver converges from every such event with no external help.
+   * The previous implementation stalled permanently in two ways:
+   *  - re-arrival after IddCxMonitorDeparture only happened in
+   *    OnUnassignedSwapChain, which the OS only calls if a swapchain WAS
+   *    assigned — a departure with no assigned swapchain latched the old
+   *    m_replugMonitor flag forever and the monitor never returned;
+   *  - nothing ever retried when the OS simply never offered a swapchain
+   *    (boot-time budget exhaustion / stale pairing after a dwm restart).
+   * Every state below has a watchdog-driven exit, so the machine cannot sit
+   * in any state forever. */
+  enum class MonitorState : LONG
+  {
+    NoMonitor      = 0, // no live monitor object; watchdog re-runs FinishInit
+    Arrived        = 1, // MonitorArrival OK, waiting for AssignSwapChain
+    SwapChainBound = 2, // swapchain assigned, processor running
+    ReplugPending  = 3, // departure issued; FinishInit re-runs on unassign OR timeout
+  };
+
 private:
   WDFDEVICE     m_wdfDevice;
   IDDCX_ADAPTER m_adapter       = nullptr;
   IDDCX_MONITOR m_monitor       = nullptr;
-  bool          m_replugMonitor = false;
+
+  /* state machine bookkeeping — m_stateLock guards transitions and the
+   * FinishInit/ReplugMonitor bodies (CRITICAL_SECTION is reentrant per
+   * thread, so watchdog-driven transitions may call them while holding it) */
+  CRITICAL_SECTION m_stateLock = {};
+  volatile LONG m_monitorState    = (LONG)MonitorState::NoMonitor;
+  ULONGLONG     m_stateEnteredTick = 0;
+  volatile LONG m_unassignSeen    = 0; // OS confirmed the departure
+  volatile LONG m_firstFrameSeen  = 0; // >=1 acquire since the last bind
+  volatile LONG m_watchdogActive  = 0;
+  bool          m_renderAdapterSelected = false; // latch: issue once per adapter
+  WDFTIMER      m_watchdogTimer = nullptr;
+
+  void EnterState(MonitorState s);
 
   CIVSHMEM m_ivshmem;
   CHeliosSink m_heliosSink;
@@ -116,12 +152,19 @@ public:
     m_wdfDevice(wdfDevice)
   {
     InitializeCriticalSection(&m_frameLock);
+    InitializeCriticalSection(&m_stateLock);
   };
 
   virtual ~CIndirectDeviceContext()
   {
+    if (m_watchdogTimer)
+    {
+      WdfTimerStop(m_watchdogTimer, TRUE);
+      m_watchdogTimer = nullptr;
+    }
     m_heliosSink.Deinit();
     DeInitLGMP();
+    DeleteCriticalSection(&m_stateLock);
     DeleteCriticalSection(&m_frameLock);
   }
 
@@ -129,12 +172,24 @@ public:
 
   void PopulateDefaultModes();
   void InitAdapter();
+  void SelectRenderAdapter();
   void FinishInit(UINT connectorIndex);
   void ReplugMonitor();
+  void MonitorWatchdog();
 
   void OnAssignSwapChain();
   void OnUnassignedSwapChain();
   void OnSwapChainLost();
+  void OnSwapChainDeviceLost();
+
+  /* called by CSwapChainProcessor on every successful buffer acquire —
+   * disarms the first-frame (stale-binding) watchdog for this binding */
+  void NotifyFrameAcquired();
+
+  /* called by CSwapChainProcessor when its processing thread exits for any
+   * reason other than a normal terminate request — the swapchain is dead but
+   * the OS told us nothing, so schedule a monitor replug */
+  void NotifySwapChainSelfExit();
 
   NTSTATUS ParseMonitorDescription(
     const IDARG_IN_PARSEMONITORDESCRIPTION* inArgs, IDARG_OUT_PARSEMONITORDESCRIPTION* outArgs);
@@ -161,10 +216,13 @@ public:
   {
     unsigned frameIndex;
     uint8_t* mem;
+    unsigned pitch;
+    unsigned height;
   };
 
   PreparedFrameBuffer PrepareFrameBuffer(unsigned pitch, const D12FrameFormat& srcFormat, const D12FrameFormat& dstFormat, const RECT * dirtyRects, unsigned nbDirtyRects);
   void WriteFrameBuffer(unsigned frameIndex, void* src, size_t offset, size_t len, bool setWritePos) const;
+  void FinalizeFrameBuffer(unsigned frameIndex, size_t len) const;
   void FinalizeFrameBuffer(unsigned frameIndex) const;
   void PresentHeliosFrame(unsigned frameIndex);
 

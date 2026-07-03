@@ -64,6 +64,11 @@ NTSTATUS LGIddDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previousSta
   UNREFERENCED_PARAMETER(previousState);
   
   auto * wrapper = WdfObjectGet_CIndirectDeviceContextWrapper(device);
+  if (!wrapper || !wrapper->context)
+  {
+    DEBUG_ERROR("DeviceD0Entry called before device context initialization");
+    return STATUS_DEVICE_NOT_READY;
+  }
   wrapper->context->InitAdapter();
 
   return STATUS_SUCCESS;
@@ -72,6 +77,7 @@ NTSTATUS LGIddDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previousSta
 NTSTATUS LGIddAdapterInitFinished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED * args)
 {
   auto * wrapper = WdfObjectGet_CIndirectDeviceContextWrapper(adapter);
+  DEBUG_INFO("AdapterInitFinished: status=0x%08x", args->AdapterInitStatus);
   if (!NT_SUCCESS(args->AdapterInitStatus))
     return STATUS_SUCCESS;
 
@@ -82,7 +88,7 @@ NTSTATUS LGIddAdapterInitFinished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_
 NTSTATUS LGIddAdapterCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES* args)
 {
   UNREFERENCED_PARAMETER(adapter);
-  UNREFERENCED_PARAMETER(args);
+  DEBUG_INFO("AdapterCommitModes: paths=%u", args ? args->PathCount : 0);
   return STATUS_SUCCESS;
 }
 
@@ -145,6 +151,7 @@ NTSTATUS LGIddAdapterQueryTargetInfo(IDDCX_ADAPTER adapter,
 {
   UNREFERENCED_PARAMETER(adapter);
   UNREFERENCED_PARAMETER(inArgs);
+  DEBUG_INFO("AdapterQueryTargetInfo");
 
   outArgs->TargetCaps =
     (IDDCX_TARGET_CAPS)(IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE | IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE);
@@ -159,7 +166,7 @@ NTSTATUS LGIddAdapterQueryTargetInfo(IDDCX_ADAPTER adapter,
 NTSTATUS LGIddAdapterCommitModes2(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES2* args)
 {
   UNREFERENCED_PARAMETER(adapter);
-  UNREFERENCED_PARAMETER(args);
+  DEBUG_INFO("AdapterCommitModes2: paths=%u", args ? args->PathCount : 0);
   return STATUS_SUCCESS;
 }
 
@@ -189,8 +196,10 @@ NTSTATUS LGIddMonitorQueryTargetModes2(IDDCX_MONITOR monitor, const IDARG_IN_QUE
 NTSTATUS LGIddMonitorAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN* inArgs)
 {
   auto * wrapper = WdfObjectGet_CIndirectMonitorContextWrapper(monitor);
-  wrapper->context->AssignSwapChain(
+  NTSTATUS status = wrapper->context->AssignSwapChain(
     inArgs->hSwapChain, inArgs->RenderAdapterLuid, inArgs->hNextSurfaceAvailable);
+  if (!NT_SUCCESS(status))
+    return status;
   wrapper->context->GetDeviceContext()->OnAssignSwapChain();
   return STATUS_SUCCESS;
 }
@@ -274,10 +283,16 @@ NTSTATUS LGIddCreateDevice(_Inout_ PWDFDEVICE_INIT deviceInit)
    */
   l_wdfDevice = device;
 
-  status = IddCxDeviceInitialize(device);
-
   auto wrapper = WdfObjectGet_CIndirectDeviceContextWrapper(device);
   wrapper->context = new CIndirectDeviceContext(device);
   g_pipe.SetDeviceContext(wrapper->context);
+
+  status = IddCxDeviceInitialize(device);
+  if (!NT_SUCCESS(status))
+  {
+    g_pipe.SetDeviceContext(nullptr);
+    wrapper->Cleanup();
+    l_wdfDevice = nullptr;
+  }
   return status;
 }

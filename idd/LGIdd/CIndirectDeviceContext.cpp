@@ -45,6 +45,32 @@ static const struct LGMPQueueConfig POINTER_QUEUE_CONFIG =
 
 static const UINT IDDCX_VERSION_1_10 = 0x1A00;
 
+/* C5 monitor-lifecycle watchdog periods (ms). Every state has an exit:
+ * NoMonitor      → re-run FinishInit after NOMONITOR_RETRY_MS
+ * Arrived        → replug if no AssignSwapChain within OFFER_TIMEOUT_MS
+ * SwapChainBound → replug if the fresh binding never acquires a single frame
+ *                  within FIRSTFRAME_TIMEOUT_MS (a topology transition always
+ *                  redraws at least once, so zero acquires after a bind means
+ *                  dwm is feeding a different pairing instance — a stale
+ *                  binding; once one frame has arrived the watchdog disarms,
+ *                  because an idle desktop legitimately presents nothing)
+ * ReplugPending  → re-run FinishInit when the OS confirms the departure
+ *                  (UnassignSwapChain) OR unconditionally after
+ *                  REPLUG_SETTLE_MS — the OS only calls UnassignSwapChain if
+ *                  a swapchain WAS assigned, so the forced path is what makes
+ *                  the replug primitive always complete. */
+static const ULONGLONG WATCHDOG_PERIOD_MS   = 500;
+static const ULONGLONG NOMONITOR_RETRY_MS   = 5000;
+static const ULONGLONG OFFER_TIMEOUT_MS     = 10000;
+static const ULONGLONG FIRSTFRAME_TIMEOUT_MS = 10000;
+static const ULONGLONG REPLUG_SETTLE_MS     = 1000;
+
+void CIndirectDeviceContext::EnterState(MonitorState s)
+{
+  InterlockedExchange(&m_monitorState, (LONG)s);
+  m_stateEnteredTick = GetTickCount64();
+}
+
 #if defined(IDDCX_VERSION_MAJOR) && defined(IDDCX_VERSION_MINOR) && \
   (IDDCX_VERSION_MAJOR > 1 || (IDDCX_VERSION_MAJOR == 1 && IDDCX_VERSION_MINOR >= 10))
 static inline IDDCX_WIRE_BITS_PER_COMPONENT GetWireBitsPerComponent(bool hdr)
@@ -92,10 +118,14 @@ void CIndirectDeviceContext::QueryIddCxCapabilities()
   const bool hasIddCx110DDIs = false;
 #endif
 
-  m_canProcessFP16 = m_iddCxVersion >= IDDCX_VERSION_1_10 && hasIddCx110DDIs;
+  // Helios currently uses the D3D11 readback path. Keep the IDD on the legacy
+  // acquire APIs until the Helios path can prove stable FP16/HDR handling.
+  m_canProcessFP16 = false;
 
   DEBUG_INFO("IddCx version: 0x%04x", m_iddCxVersion);
-  DEBUG_INFO("IddCx 1.10 HDR/WCG DDIs: %s", m_canProcessFP16 ? "available" : "unavailable");
+  DEBUG_INFO("IddCx 1.10 HDR/WCG DDIs: %s (runtime support: %s)",
+    m_canProcessFP16 ? "enabled" : "disabled",
+    (m_iddCxVersion >= IDDCX_VERSION_1_10 && hasIddCx110DDIs) ? "available" : "unavailable");
 }
 
 void CIndirectDeviceContext::PopulateDefaultModes()
@@ -179,20 +209,73 @@ void CIndirectDeviceContext::InitAdapter()
 
   m_adapter = initOut.AdapterObject;
 
-  // Render-adapter selection for the IDD compositor.
-  //
-  // Default (HKLM\SOFTWARE\LookingGlass\IDD\HeliosRenderAdapter == 0): force the
-  // IDD onto the software render adapter (Microsoft Basic Render Driver / WARP).
-  // If IddCx chooses by itself it can pick the Helios render adapter, and until
-  // Helios is fully compositable that pulls DWM/Explorer into the experimental UMD
-  // path and can crash-loop the desktop.
-  //
-  // Experimental (HeliosRenderAdapter == 1): select the Helios WDDM render adapter
-  // (PCI\VEN_1AF4&DEV_1050) so the OS composites the desktop ON Helios → venus →
-  // host GPU, and the IDD captures the composed frame via the standard IddCx
-  // swapchain. This is the goal path; gated behind the registry flag so it is
-  // reversible without a rebuild (flip to 0 + reboot, or boot gpu-gl-out to
-  // recover) given the crash-loop risk during bring-up.
+  auto * wrapper = WdfObjectGet_CIndirectDeviceContextWrapper(m_adapter);
+  wrapper->context = this;
+
+  // Render-adapter selection happens in FinishInit (see SelectRenderAdapter):
+  // calling IddCxAdapterSetRenderAdapter here, before the async adapter init
+  // has completed, is silently rejected and the OS keeps its own pick.
+
+  /* C5: the monitor-lifecycle watchdog. Deliberately NOT the LGMP timer: the
+   * LGMP timer only exists once the first swapchain arrives (SetupLGMP), and
+   * the most important watchdog case is exactly "the first swapchain never
+   * arrived". This timer lives from adapter init so boot-time convergence is
+   * covered too. */
+  {
+    WDF_TIMER_CONFIG config;
+    WDF_TIMER_CONFIG_INIT_PERIODIC(&config,
+      [](WDFTIMER timer) -> void
+      {
+        WDFOBJECT parent = WdfTimerGetParentObject(timer);
+        auto wrapper = WdfObjectGet_CIndirectDeviceContextWrapper(parent);
+        wrapper->context->MonitorWatchdog();
+      },
+      (ULONG)WATCHDOG_PERIOD_MS);
+    config.AutomaticSerialization = FALSE;
+
+    WDF_OBJECT_ATTRIBUTES attribs;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attribs);
+    attribs.ParentObject   = m_wdfDevice;
+    attribs.ExecutionLevel = WdfExecutionLevelDispatch;
+
+    NTSTATUS ts = WdfTimerCreate(&config, &attribs, &m_watchdogTimer);
+    if (!NT_SUCCESS(ts))
+      DEBUG_ERROR_HR(ts, "Monitor watchdog timer creation failed; "
+                         "lifecycle self-convergence is unavailable");
+    else
+      WdfTimerStart(m_watchdogTimer, WDF_REL_TIMEOUT_IN_MS((ULONG)WATCHDOG_PERIOD_MS));
+  }
+
+  DEBUG_INFO("Helios: IDD Vulkan output sink disabled; using normal Looking Glass capture path");
+}
+
+// Render-adapter selection for the IDD compositor.
+//
+// Default (HKLM\SOFTWARE\LookingGlass\IDD\HeliosRenderAdapter == 0): force the
+// IDD onto the software render adapter (Microsoft Basic Render Driver / WARP).
+// If IddCx chooses by itself it picks the Helios render adapter, and until
+// Helios is fully compositable that pulls DWM/Explorer into the experimental UMD
+// path and can crash-loop the desktop.
+//
+// Experimental (HeliosRenderAdapter == 1): select the Helios WDDM render adapter
+// (PCI\VEN_1AF4&DEV_1050) so the OS composites the desktop ON Helios → venus →
+// host GPU, and the IDD captures the composed frame via the standard IddCx
+// swapchain. This is the goal path; gated behind the registry flag so it is
+// reversible without a rebuild (flip to 0 + restart the device) given the
+// crash-loop risk during bring-up.
+void CIndirectDeviceContext::SelectRenderAdapter()
+{
+  /* Latched once per adapter lifetime. Re-issuing the preference on every
+   * FinishInit/replug re-triggered render/indirect pairing re-creation each
+   * cycle — a positive-feedback churn loop (replug → SetRenderAdapter →
+   * pairing churn → ACCESS_LOST → replug). The preference is adapter-scoped
+   * state; once issued it persists for this adapter instance. */
+  if (m_renderAdapterSelected)
+  {
+    DEBUG_TRACE("SelectRenderAdapter: already latched for this adapter, skipping");
+    return;
+  }
+
   const bool preferHelios = g_settings.ReadBoolValue(L"HeliosRenderAdapter", false);
 
   IDXGIFactory * factory = NULL;
@@ -213,11 +296,13 @@ void CIndirectDeviceContext::InitAdapter()
 
       const bool wanted = preferHelios ? isHelios : isBasicRenderDriver;
 
-      DEBUG_INFO(L"IDD render adapter[%u]: %s vendor=0x%04x device=0x%04x%s",
+      DEBUG_INFO(L"IDD render adapter[%u]: %s vendor=0x%04x device=0x%04x luid=%08x:%08x%s",
         i,
         adapterDesc.Description,
         adapterDesc.VendorId,
         adapterDesc.DeviceId,
+        (unsigned)adapterDesc.AdapterLuid.HighPart,
+        (unsigned)adapterDesc.AdapterLuid.LowPart,
         wanted ? L" selected" : L" skipped");
 
       if (!wanted)
@@ -225,10 +310,13 @@ void CIndirectDeviceContext::InitAdapter()
 
       IDARG_IN_ADAPTERSETRENDERADAPTER args = {};
       args.PreferredRenderAdapter = adapterDesc.AdapterLuid;
+      /* returns void: the preference is fire-and-forget; whether the OS
+       * honors it shows up in the next AssignSwapChain's renderAdapter LUID */
       IddCxAdapterSetRenderAdapter(m_adapter, &args);
-      DEBUG_INFO(L"IDD selected render adapter: %s (preferHelios=%d)",
+      DEBUG_INFO(L"IddCxAdapterSetRenderAdapter(%s, preferHelios=%d) issued",
         adapterDesc.Description, preferHelios ? 1 : 0);
       selectedRenderAdapter = true;
+      m_renderAdapterSelected = true;
       break;
     }
     factory->Release();
@@ -237,19 +325,27 @@ void CIndirectDeviceContext::InitAdapter()
     DEBUG_WARN("CreateDXGIFactory failed while selecting IDD render adapter");
 
   if (!selectedRenderAdapter)
-    DEBUG_WARN("Preferred IDD render adapter not found; IddCx render adapter remains OS-selected");
-
-  auto * wrapper = WdfObjectGet_CIndirectDeviceContextWrapper(m_adapter);
-  wrapper->context = this;  
-
-  if (!m_heliosSink.Init())
-    DEBUG_WARN("Helios: IDD Vulkan sink disabled after initialization failure");
+    DEBUG_WARN("Render-adapter preference NOT registered; IddCx render adapter remains OS-selected");
 }
 
 void CIndirectDeviceContext::FinishInit(UINT connectorIndex)
 {
+  EnterCriticalSection(&m_stateLock);
+  DEBUG_INFO("FinishInit: connectorIndex=%u", connectorIndex);
+
+  SelectRenderAdapter();
+
   WDF_OBJECT_ATTRIBUTES attr;
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, CIndirectMonitorContextWrapper);
+  /* free the heap CIndirectMonitorContext when IddCx deletes the monitor
+   * object (departed monitors) — replugs are automatic now, so this leaked
+   * once per replug before */
+  attr.EvtCleanupCallback = [](WDFOBJECT object)
+  {
+    auto * w = WdfObjectGet_CIndirectMonitorContextWrapper(object);
+    if (w)
+      w->Cleanup();
+  };
 
   IDDCX_MONITOR_INFO info = {};
   info.Size           = sizeof(info);
@@ -272,8 +368,12 @@ void CIndirectDeviceContext::FinishInit(UINT connectorIndex)
   if (!NT_SUCCESS(status))
   {
     DEBUG_ERROR_HR(status, "IddCxMonitorCreate Failed");
+    /* watchdog retries FinishInit after NOMONITOR_RETRY_MS */
+    EnterState(MonitorState::NoMonitor);
+    LeaveCriticalSection(&m_stateLock);
     return;
   }
+  DEBUG_INFO("IddCxMonitorCreate OK");
 
   m_monitor = createOut.MonitorObject;
   auto * wrapper = WdfObjectGet_CIndirectMonitorContextWrapper(m_monitor);
@@ -284,35 +384,134 @@ void CIndirectDeviceContext::FinishInit(UINT connectorIndex)
   if (FAILED(status))
   {
     DEBUG_ERROR_HR(status, "IddCxMonitorArrival Failed");
+    /* the monitor object exists but never arrived — delete it so the
+     * NoMonitor retry does not pile up monitor objects */
+    delete wrapper->context;
+    wrapper->context = nullptr;
+    WdfObjectDelete((WDFOBJECT)m_monitor);
+    m_monitor = nullptr;
+    EnterState(MonitorState::NoMonitor);
+    LeaveCriticalSection(&m_stateLock);
     return;
   }
+  DEBUG_INFO("IddCxMonitorArrival OK");
+
+  /* waiting for AssignSwapChain; watchdog replugs after OFFER_TIMEOUT_MS */
+  InterlockedExchange(&m_unassignSeen, 0);
+  InterlockedExchange(&m_firstFrameSeen, 0);
+  EnterState(MonitorState::Arrived);
+  LeaveCriticalSection(&m_stateLock);
 }
 
+/* The replug primitive. ALWAYS completes: departure moves the machine to
+ * ReplugPending, and the watchdog re-runs FinishInit either when the OS
+ * confirms via UnassignSwapChain or unconditionally after REPLUG_SETTLE_MS.
+ * (The old implementation re-armed only from OnUnassignedSwapChain, which the
+ * OS never calls when no swapchain was assigned at departure time — the
+ * monitor then never returned and every future replug no-op'd.) */
 void CIndirectDeviceContext::ReplugMonitor()
 {
+  EnterCriticalSection(&m_stateLock);
+
+  if ((MonitorState)m_monitorState == MonitorState::ReplugPending)
+  {
+    LeaveCriticalSection(&m_stateLock);
+    return;
+  }
+
   if (m_monitor == WDF_NO_HANDLE)
   {
+    LeaveCriticalSection(&m_stateLock);
     FinishInit(0);
     return;
   }
 
-  if (m_replugMonitor)
-    return;
-
   DEBUG_TRACE("ReplugMonitor");
-  m_replugMonitor = true;
+  InterlockedExchange(&m_unassignSeen, 0);
   NTSTATUS status = IddCxMonitorDeparture(m_monitor);
   if (!NT_SUCCESS(status))
   {
-    m_replugMonitor = false;
     DEBUG_ERROR("IddCxMonitorDeparture Failed (0x%08x)", status);
+    /* monitor presumably still live — fall back to Arrived so the
+     * offer-timeout watchdog retries the replug later instead of stalling */
+    EnterState(MonitorState::Arrived);
+    LeaveCriticalSection(&m_stateLock);
     return;
   }
+
+  /* IddCx owns the departed monitor object's teardown; FinishInit creates a
+   * fresh one and overwrites m_monitor */
+  EnterState(MonitorState::ReplugPending);
+  LeaveCriticalSection(&m_stateLock);
+}
+
+/* Runs every WATCHDOG_PERIOD_MS from its own WDF timer (alive from adapter
+ * init, unlike the LGMP timer which only exists after the first swapchain).
+ * This is the single place that drives recovery transitions, so recovery does
+ * not depend on any OS callback that may never come. */
+void CIndirectDeviceContext::MonitorWatchdog()
+{
+  if (!m_adapter)
+    return;
+
+  /* skip if a previous invocation is still running (FinishInit can block) */
+  if (InterlockedCompareExchange(&m_watchdogActive, 1, 0) != 0)
+    return;
+
+  EnterCriticalSection(&m_stateLock);
+  const ULONGLONG elapsed = GetTickCount64() - m_stateEnteredTick;
+
+  switch ((MonitorState)m_monitorState)
+  {
+    case MonitorState::NoMonitor:
+      if (elapsed >= NOMONITOR_RETRY_MS)
+      {
+        DEBUG_WARN("Watchdog: no monitor for %llums, re-running FinishInit", elapsed);
+        FinishInit(0);
+      }
+      break;
+
+    case MonitorState::Arrived:
+      if (elapsed >= OFFER_TIMEOUT_MS)
+      {
+        DEBUG_WARN("Watchdog: monitor arrived but no AssignSwapChain within %llums, replugging", elapsed);
+        ReplugMonitor();
+      }
+      break;
+
+    case MonitorState::SwapChainBound:
+      if (!InterlockedCompareExchange(&m_firstFrameSeen, 0, 0) &&
+          elapsed >= FIRSTFRAME_TIMEOUT_MS)
+      {
+        DEBUG_WARN("Watchdog: swapchain bound but zero frames acquired within %llums "
+                   "(stale binding), replugging", elapsed);
+        ReplugMonitor();
+      }
+      break;
+
+    case MonitorState::ReplugPending:
+      if (InterlockedCompareExchange(&m_unassignSeen, 0, 0) ||
+          elapsed >= REPLUG_SETTLE_MS)
+      {
+        DEBUG_INFO("Watchdog: completing replug (%s after %llums)",
+          m_unassignSeen ? "unassign confirmed" : "forced", elapsed);
+        FinishInit(0);
+      }
+      break;
+  }
+
+  LeaveCriticalSection(&m_stateLock);
+  InterlockedExchange(&m_watchdogActive, 0);
 }
 
 void CIndirectDeviceContext::OnAssignSwapChain()
 {
   InterlockedExchange(&m_recoverModeUpdateSwapChain, 0);
+
+  EnterCriticalSection(&m_stateLock);
+  InterlockedExchange(&m_firstFrameSeen, 0);
+  EnterState(MonitorState::SwapChainBound);
+  LeaveCriticalSection(&m_stateLock);
 
   if (m_doSetMode)
   {
@@ -325,12 +524,34 @@ void CIndirectDeviceContext::OnUnassignedSwapChain()
 {
   InterlockedExchange(&m_replugMonitorQueued, 0);
   InterlockedExchange(&m_recoverModeUpdateSwapChain, 0);
+  InterlockedExchange(&m_unassignSeen, 1);
 
-  if (m_replugMonitor)
+  EnterCriticalSection(&m_stateLock);
+  if ((MonitorState)m_monitorState != MonitorState::ReplugPending)
   {
-    m_replugMonitor = false;
-    FinishInit(0);
+    /* OS-initiated unassign (topology change): the monitor is still live and
+     * a re-offer should follow — wait in Arrived; if the OS never re-offers,
+     * the offer-timeout watchdog replugs */
+    EnterState(MonitorState::Arrived);
   }
+  /* if a replug is pending, the watchdog completes it (unassignSeen fast
+   * path) — do NOT FinishInit from this callback: the forced-timeout path
+   * must remain the single re-arrival driver alongside it, and running
+   * FinishInit on the watchdog thread keeps re-arrival single-threaded */
+  LeaveCriticalSection(&m_stateLock);
+}
+
+void CIndirectDeviceContext::NotifyFrameAcquired()
+{
+  InterlockedExchange(&m_firstFrameSeen, 1);
+}
+
+void CIndirectDeviceContext::NotifySwapChainSelfExit()
+{
+  if (InterlockedExchange(&m_replugMonitorQueued, 1))
+    return;
+
+  DEBUG_WARN("Swapchain processor exited without a terminate request, queueing monitor replug");
 }
 
 void CIndirectDeviceContext::OnSwapChainLost()
@@ -346,6 +567,17 @@ void CIndirectDeviceContext::OnSwapChainLost()
     return;
 
   DEBUG_WARN("Swap chain was lost after a mode update, falling back to monitor replug");
+}
+
+void CIndirectDeviceContext::OnSwapChainDeviceLost()
+{
+  // IddCx/DXGI can report DXGI_ERROR_ACCESS_LOST when the swapchain's keyed
+  // mutex is abandoned. Queue a monitor replug from the LGMP timer instead of
+  // tearing down IddCx objects from the swapchain worker thread.
+  if (InterlockedExchange(&m_replugMonitorQueued, 1))
+    return;
+
+  DEBUG_WARN("Swap chain device/access was lost, queueing monitor replug");
 }
 
 static inline void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO & mode, DWORD width, DWORD height, DWORD vsync, bool monitorMode)
@@ -984,6 +1216,8 @@ CIndirectDeviceContext::PreparedFrameBuffer CIndirectDeviceContext::PrepareFrame
 
   result.frameIndex = m_frameIndex;
   result.mem        = fb->data;
+  result.pitch      = pitch;
+  result.height     = fi->dataHeight;
 
   m_hasFrame = true;
 out:
@@ -1004,23 +1238,20 @@ void CIndirectDeviceContext::WriteFrameBuffer(unsigned frameIndex, void* src, si
     fb->wp = (uint32_t)(offset + len);
 }
 
-void CIndirectDeviceContext::FinalizeFrameBuffer(unsigned frameIndex) const
+void CIndirectDeviceContext::FinalizeFrameBuffer(unsigned frameIndex, size_t len) const
 {
   FrameBuffer * fb = m_frameBuffer[frameIndex];
-  fb->wp = m_height * m_pitch;
+  fb->wp = (uint32_t)len;
+}
+
+void CIndirectDeviceContext::FinalizeFrameBuffer(unsigned frameIndex) const
+{
+  FinalizeFrameBuffer(frameIndex, (size_t)m_height * m_pitch);
 }
 
 void CIndirectDeviceContext::PresentHeliosFrame(unsigned frameIndex)
 {
-  if (frameIndex >= LGMP_Q_FRAME_LEN)
-    return;
-
-  KVMFRFrame * frame = m_frame[frameIndex];
-  FrameBuffer * fb = m_frameBuffer[frameIndex];
-  if (!frame || !fb)
-    return;
-
-  m_heliosSink.Present(frame, fb->data);
+  (void)frameIndex;
 }
 
 void CIndirectDeviceContext::SendCursor(const IDARG_OUT_QUERY_HWCURSOR& info, const BYTE * data)
