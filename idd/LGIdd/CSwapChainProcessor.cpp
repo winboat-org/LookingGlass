@@ -53,21 +53,22 @@ CSwapChainProcessor::~CSwapChainProcessor()
    * join and NO wait here — this can run inside an IddCx DDI callback, and
    * IddCx's watchdog terminates WUDFHost when a callback overruns.
    *
-   * IDDCX_SWAPCHAIN ownership: the driver owns the handle only if
-   * EvtIddCxMonitorAssignSwapChain returned success (if Start() failed,
-   * AssignSwapChain calls DisownSwapChain() and returns ABANDON, and IddCx
-   * deletes the swapchain itself). The owned handle is deleted HERE, when
-   * nothing can touch it anymore. Never delete it from a still-assigned
-   * state on the thread-exit path: deleting an ASSIGNED swapchain corrupts
-   * IddCx's internal lists when the subsequent monitor departure processes
-   * it (FAST_FAIL_CORRUPT_LIST_ENTRY in iddcx.dll). By last-reference time
-   * either the OS unassigned (monitor released after
-   * EvtIddCxMonitorUnassignSwapChain) or the monitor is being cleaned up. */
-  if (m_hSwapChain)
-  {
-    WdfObjectDelete((WDFOBJECT)m_hSwapChain);
-    m_hSwapChain = nullptr;
-  }
+   * IDDCX_SWAPCHAIN ownership: the driver NEVER deletes the swapchain object
+   * at teardown. Per the IddCx object model ("IddCx Objects", WDK docs) the
+   * OS creates and destroys IDDCX_SWAPCHAIN objects, and the swapchain is a
+   * CHILD of the IDDCX_MONITOR — IddCxMonitorDeparture (our replug
+   * primitive) destroys the monitor and with it the child swapchain. The
+   * previous dtor-time WdfObjectDelete here was a double delete of that
+   * already-destroyed child: the freed FxObject's lock faulted inside
+   * FxObject::DeleteObject → unhandled exception → WUDFHost terminated →
+   * devnode FAILED_POST_START (dump WUDFHost.exe-(PID-11016) 2026-07-03
+   * 09:40Z, thread 9: ~CSwapChainProcessor → imp_WdfObjectDelete →
+   * RtlEnterCriticalSection → KiUserExceptionDispatch). The only
+   * doc-sanctioned driver-side delete is the mid-frame-processing "release
+   * ownership so the OS re-offers" signal, which this driver does not use —
+   * thread-exit errors escalate to the monitor replug primitive instead,
+   * and departure/re-arrival produces the new offer. */
+  m_hSwapChain = nullptr;
 
   if (m_dx12Device)
   {
