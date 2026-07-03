@@ -175,6 +175,8 @@ private:
   bool m_doSetMode = false;
   volatile LONG m_replugMonitorQueued = 0;
   volatile LONG m_recoverModeUpdateSwapChain = 0;
+  /* see ProcessorSerial() */
+  HANDLE m_processorSerial = nullptr;
 
 public:
   CIndirectDeviceContext(_In_ WDFDEVICE wdfDevice) :
@@ -182,6 +184,7 @@ public:
   {
     InitializeCriticalSection(&m_frameLock);
     InitializeCriticalSection(&m_stateLock);
+    m_processorSerial = CreateSemaphore(nullptr, 1, 1, nullptr);
   };
 
   virtual ~CIndirectDeviceContext()
@@ -193,9 +196,27 @@ public:
     }
     m_heliosSink.Deinit();
     DeInitLGMP();
+    if (m_processorSerial)
+    {
+      CloseHandle(m_processorSerial);
+      m_processorSerial = nullptr;
+    }
     DeleteCriticalSection(&m_stateLock);
     DeleteCriticalSection(&m_frameLock);
   }
+
+  /* Serializes swapchain-processor lifecycles on this device. The assign
+   * callback must never block (UMDF kills on callback overrun), so a
+   * superseded processor's teardown inherently overlaps its successor's
+   * bring-up — and both drive the SAME d3d11 runtime, whose internal lock
+   * convoys them: the successor's (validate-slow, tens-of-seconds) device
+   * create blocks the predecessor's IddCxSwapChainFinishedProcessingFrame,
+   * the acquired frame outlives IddCx's deadline, and IddCx terminates
+   * WUDFHost (ReportBugcheckForSwapChainTimeoutDriverDidNotReleaseFrame —
+   * two kills root-caused from dumps, 2026-07-04). Each processor's thread
+   * acquires this before touching D3D11 and releases it after full teardown,
+   * on ITS OWN thread where blocking is legal. */
+  HANDLE ProcessorSerial() const { return m_processorSerial; }
 
   bool SetupLGMP(size_t alignSize);
 

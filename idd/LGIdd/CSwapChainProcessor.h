@@ -80,6 +80,11 @@ private:
    * escalate to the monitor lifecycle like any other self-exit */
   volatile LONG m_selfTerminated = 0;
 
+  /* holding the device context's processor-serial semaphore (acquired on the
+   * processing thread before bring-up, released at the end of teardown after
+   * the D3D devices are gone) — see CIndirectDeviceContext::ProcessorSerial */
+  bool m_serialHeld = false;
+
   static DWORD CALLBACK _SwapChainThread(LPVOID arg);
   void SwapChainThread();
   /* returns true if the loop ended because termination was requested

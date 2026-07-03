@@ -77,6 +77,17 @@ CSwapChainProcessor::~CSwapChainProcessor()
     m_fbPool.Reset();
   }
   delete[] m_shapeBuffer;
+
+  /* Release the D3D devices HERE (not via member destruction after this
+   * body) so the runtime-lock-heavy device release still happens under the
+   * processor-serial gate, then let the successor proceed. */
+  m_dx11Device.reset();
+  m_dx12Device.reset();
+  if (m_serialHeld)
+  {
+    ReleaseSemaphore(m_devContext->ProcessorSerial(), 1, nullptr);
+    m_serialHeld = false;
+  }
 }
 
 void CSwapChainProcessor::Stop()
@@ -130,6 +141,33 @@ void CSwapChainProcessor::SwapChainThread()
   HANDLE avTaskHandle = AvSetMmThreadCharacteristicsW(L"Distribution", &avTask);
 
   DEBUG_INFO("Start Thread");
+
+  /* Serialize processor lifecycles: wait for the superseded processor to
+   * finish tearing down (including its D3D device release) before this one
+   * touches the d3d11 runtime. Both drive the SAME runtime instance, whose
+   * internal lock otherwise convoys them — the successor's slow device
+   * create blocks the predecessor's IddCxSwapChainFinishedProcessingFrame,
+   * the acquired frame outlives IddCx's deadline, and IddCx terminates
+   * WUDFHost (two dump-verified kills, 2026-07-04). Blocking is legal HERE
+   * (own thread, not a DDI callback). Bounded: a predecessor stuck in a
+   * tens-of-seconds syscall must not wedge recovery forever — after the
+   * timeout we proceed unserialized (the pre-fix behaviour) and say so. */
+  {
+    HANDLE serialWait[] = { m_devContext->ProcessorSerial(), m_terminateEvent.Get() };
+    const DWORD sw = WaitForMultipleObjects(ARRAYSIZE(serialWait), serialWait, FALSE, 15000);
+    if (sw == WAIT_OBJECT_0)
+      m_serialHeld = true;
+    else if (sw == WAIT_OBJECT_0 + 1)
+    {
+      DEBUG_INFO("Swapchain thread stopped while waiting for predecessor teardown");
+      AvRevertMmThreadCharacteristics(avTaskHandle);
+      return;
+    }
+    else
+      DEBUG_WARN("Predecessor processor teardown did not finish within 15s; "
+                 "proceeding unserialized (runtime-lock convoy risk)");
+  }
+
   const bool terminated = SwapChainThreadCore();
 
   /* the swapchain object is deleted by the DESTRUCTOR, not here: at this
