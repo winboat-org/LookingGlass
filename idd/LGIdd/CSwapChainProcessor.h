@@ -36,12 +36,23 @@ using namespace Microsoft::WRL;
 
 #define STAGING_TEXTURES 3
 
-class CSwapChainProcessor
+/* Lifetime model: shared_ptr-managed. Each processing thread holds its own
+ * reference (handed over at CreateThread), and the monitor context holds one.
+ * Stop() only SIGNALS termination — it never joins: a processing thread can
+ * be blocked inside D3D11CreateDevice or IddCxSwapChainSetDevice for tens of
+ * seconds during boot/restart pairing churn, and IddCx's watchdog TERMINATES
+ * WUDFHost when a DDI callback (Assign/UnassignSwapChain) overruns
+ * (IddWatchdog::WatchdogThread -> IddAdapter::ReportBugcheck ->
+ * TerminateProcess; full-memory dump 2026-07-03 09:07). The last exiting
+ * thread drops the last reference and the destructor — which therefore never
+ * has live threads to wait for — deletes the swapchain object. */
+class CSwapChainProcessor : public std::enable_shared_from_this<CSwapChainProcessor>
 {
 private:
   IDDCX_MONITOR                   m_monitor;
   CIndirectDeviceContext        * m_devContext;
   IDDCX_SWAPCHAIN                 m_hSwapChain;
+  LUID                            m_renderAdapter;
   std::shared_ptr<CD3D11Device>   m_dx11Device;
   std::shared_ptr<CD3D12Device>   m_dx12Device;
   HANDLE                          m_newFrameEvent;
@@ -75,6 +86,12 @@ private:
    * (destructor / cursor-thread terminate), false on a self-exit (error) —
    * the caller escalates self-exits to a monitor replug */
   bool SwapChainThreadCore();
+  /* device bring-up, pool init and LGMP setup — runs on the processing
+   * thread, NEVER in EvtIddCxMonitorAssignSwapChain: D3D11CreateDevice and
+   * IddCxSwapChainSetDevice were both observed blocking for many seconds
+   * during boot/restart pairing churn, and UMDF terminates the host when the
+   * callback overruns (the FAILED_POST_START kill class, 2026-07-03) */
+  bool InitDevices();
   HRESULT SetSwapChainDevice();
 
   static DWORD CALLBACK _CursorThread(LPVOID arg);
@@ -90,9 +107,15 @@ private:
 
 public:
   CSwapChainProcessor(IDDCX_MONITOR monitor, CIndirectDeviceContext * devContext, IDDCX_SWAPCHAIN hSwapChain,
-    std::shared_ptr<CD3D11Device> dx11Device, std::shared_ptr<CD3D12Device> dx12Device, HANDLE newFrameEvent);
+    LUID renderAdapter, HANDLE newFrameEvent);
   ~CSwapChainProcessor();
+
+  /* the object MUST be owned by a std::shared_ptr before Start() is called
+   * (the thread acquires its reference via shared_from_this) */
   HRESULT Start();
+
+  /* signal-only termination; safe to call from any IddCx DDI callback */
+  void Stop();
 
   /* Call before destroying the processor when AssignSwapChain returns a
    * failure status: IddCx retains ownership of the swapchain on failure and

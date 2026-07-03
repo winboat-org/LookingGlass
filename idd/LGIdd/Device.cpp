@@ -196,11 +196,23 @@ NTSTATUS LGIddMonitorQueryTargetModes2(IDDCX_MONITOR monitor, const IDARG_IN_QUE
 NTSTATUS LGIddMonitorAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN* inArgs)
 {
   auto * wrapper = WdfObjectGet_CIndirectMonitorContextWrapper(monitor);
+  auto * device  = wrapper->context->GetDeviceContext();
+
+  /* bracket the callback so no replug can depart this monitor while its
+   * assignment is executing (iddcx list corruption otherwise — see
+   * CIndirectDeviceContext::ReplugMonitor) */
+  device->AssignCallbackEnter();
   NTSTATUS status = wrapper->context->AssignSwapChain(
     inArgs->hSwapChain, inArgs->RenderAdapterLuid, inArgs->hNextSurfaceAvailable);
   if (!NT_SUCCESS(status))
+  {
+    device->AssignCallbackExit();
     return status;
-  wrapper->context->GetDeviceContext()->OnAssignSwapChain();
+  }
+  /* transition the state machine BEFORE dropping the in-flight guard so the
+   * watchdog never observes a stale Arrived state for a bound swapchain */
+  device->OnAssignSwapChain();
+  device->AssignCallbackExit();
   return STATUS_SUCCESS;
 }
 

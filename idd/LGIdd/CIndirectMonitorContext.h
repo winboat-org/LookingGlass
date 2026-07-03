@@ -35,11 +35,11 @@ class CIndirectMonitorContext
 private:
   IDDCX_MONITOR m_monitor;
 
-  std::shared_ptr<CD3D11Device> m_dx11Device;
-  std::shared_ptr<CD3D12Device> m_dx12Device;
 
   CIndirectDeviceContext * m_devContext;
-  std::unique_ptr<CSwapChainProcessor> m_swapChain;
+  /* shared: the processing threads hold their own references, so releasing
+   * ours (UnassignSwapChain) never waits on them — see CSwapChainProcessor */
+  std::shared_ptr<CSwapChainProcessor> m_swapChain;
 
 public:
   CIndirectMonitorContext(_In_ IDDCX_MONITOR monitor, CIndirectDeviceContext * device);

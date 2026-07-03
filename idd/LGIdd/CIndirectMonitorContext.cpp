@@ -36,65 +36,23 @@ CIndirectMonitorContext::~CIndirectMonitorContext()
 
 NTSTATUS CIndirectMonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent)
 {
-  /* cap the RETRY re-init loop: unbounded, it can spin forever INSIDE the
-   * AssignSwapChain callback, wedging IddCx's calling thread */
-  unsigned reInitAttempts = 0;
-reInit:
   UnassignSwapChain();
 
-  DEBUG_INFO("AssignSwapChain: renderAdapter LUID=%08x:%08x",
+  DEBUG_INFO("AssignSwapChain: renderAdapter LUID=%08x:%08x (device bring-up deferred to the processor thread)",
     (unsigned)renderAdapter.HighPart, (unsigned)renderAdapter.LowPart);
 
-  m_dx11Device = std::make_shared<CD3D11Device>(renderAdapter);
-  HRESULT dx11hr = m_dx11Device->Init();
-  if (FAILED(dx11hr))
-  {
-    DEBUG_ERROR_HR(dx11hr, "AssignSwapChain: CD3D11Device::Init FAILED (this gates the whole capture path)");
-    /* Do NOT WdfObjectDelete here: ownership of hSwapChain only transfers to
-     * the driver when EvtIddCxMonitorAssignSwapChain returns success. On a
-     * failure return IddCx deletes the swapchain itself
-     * (IddMonitor::HandleNewSwapChain), so deleting it here double-deletes
-     * the FxObject and crashes WUDFHost -> the IDD goes Code 43. */
-    return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
-  }
-  DEBUG_INFO("AssignSwapChain: CD3D11Device::Init OK");
-
-  UINT64 alignSize = CPlatformInfo::GetPageSize();
-  m_dx12Device = std::make_shared<CD3D12Device>(renderAdapter);
-  switch (m_dx12Device->Init(m_devContext->GetIVSHMEM(), alignSize))
-  {
-    case CD3D12Device::SUCCESS:
-      DEBUG_INFO("AssignSwapChain: CD3D12Device::Init OK");
-      break;
-
-    case CD3D12Device::FAILURE:
-      DEBUG_WARN("AssignSwapChain: CD3D12Device::Init FAILURE; using D3D11 readback path");
-      m_dx12Device.reset();
-      alignSize = CPlatformInfo::GetPageSize();
-      break;
-
-    case CD3D12Device::RETRY:
-      DEBUG_INFO("AssignSwapChain: CD3D12Device::Init RETRY");
-      m_dx12Device.reset();
-      m_dx11Device.reset();
-      if (++reInitAttempts >= 3)
-      {
-        DEBUG_ERROR("AssignSwapChain: CD3D12Device::Init RETRY %u times, abandoning swapchain "
-                    "(the OS will offer a new one; the monitor watchdog replugs if it never does)",
-          reInitAttempts);
-        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
-      }
-      goto reInit;
-  }
-  
-  if (!m_devContext->SetupLGMP(alignSize))
-  {
-    DEBUG_ERROR("SetupLGMP failed");
-    /* failure return -> IddCx owns and deletes the swapchain; see above */
-    return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
-  }
-
-  m_swapChain.reset(new CSwapChainProcessor(m_monitor, m_devContext, swapChain, m_dx11Device, m_dx12Device, newFrameEvent));
+  /* NO blocking work in this callback. D3D11CreateDevice and
+   * IddCxSwapChainSetDevice were both observed blocking for 6-22+ seconds
+   * during boot/restart pairing churn, and UMDF terminates the host when
+   * EvtIddCxMonitorAssignSwapChain overruns — every FAILED_POST_START kill
+   * of 2026-07-03 (boots #1/#2/#4 and the warm deploy crashes) happened with
+   * this callback still executing. All bring-up (D3D11/D3D12 devices, pools,
+   * LGMP, SetDevice) now runs on the processor thread
+   * (CSwapChainProcessor::InitDevices); a bring-up failure self-exits the
+   * thread, which queues a monitor replug — the single recovery primitive
+   * (this also covers the born-abandoned first swapchain of a boot, which
+   * previously returned ABANDON_SWAPCHAIN from here). */
+  m_swapChain = std::make_shared<CSwapChainProcessor>(m_monitor, m_devContext, swapChain, renderAdapter, newFrameEvent);
   HRESULT startHr = m_swapChain->Start();
   if (FAILED(startHr))
   {
@@ -110,7 +68,15 @@ reInit:
 
 void CIndirectMonitorContext::UnassignSwapChain()
 {
-  m_swapChain.reset();  
-  m_dx11Device.reset();
-  m_dx12Device.reset();
+  /* signal + release, NEVER join: this runs inside
+   * EvtIddCxMonitorUnassignSwapChain (or monitor cleanup), and IddCx's
+   * watchdog terminates WUDFHost when a DDI callback overruns. The
+   * processing threads hold their own references and finish teardown
+   * (including the swapchain object delete) when their current blocking
+   * call returns. */
+  if (m_swapChain)
+  {
+    m_swapChain->Stop();
+    m_swapChain.reset();
+  }
 }

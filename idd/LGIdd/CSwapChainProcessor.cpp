@@ -23,25 +23,23 @@
 #include <avrt.h>
 #include "CDebug.h"
 #include "CPipeServer.h"
+#include "CPlatformInfo.h"
 
 CSwapChainProcessor::CSwapChainProcessor(IDDCX_MONITOR monitor, CIndirectDeviceContext* devContext, IDDCX_SWAPCHAIN hSwapChain,
-    std::shared_ptr<CD3D11Device> dx11Device, std::shared_ptr<CD3D12Device> dx12Device, HANDLE newFrameEvent) :
+    LUID renderAdapter, HANDLE newFrameEvent) :
   m_monitor(monitor),
   m_devContext(devContext),
   m_hSwapChain(hSwapChain),
-  m_dx11Device(dx11Device),
-  m_dx12Device(dx12Device),
+  m_renderAdapter(renderAdapter),
   m_newFrameEvent(newFrameEvent)
 {
-  if (dx12Device)
-  {
-    m_resPool.Init(dx11Device, dx12Device);
-    m_fbPool.Init(this);
-    if (!m_postProcessor.Init(dx12Device))
-      DEBUG_ERROR("Failed to initialize post processor");
-  }
+  /* the D3D devices, pools and LGMP are brought up by InitDevices() on the
+   * processing thread — this constructor runs inside the AssignSwapChain
+   * callback and must not block */
 
-  m_terminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+  /* MANUAL-RESET: termination is a latch observed by BOTH processing threads
+   * and by mid-bring-up checks; an auto-reset event only wakes one waiter */
+  m_terminateEvent.Attach(CreateEvent(nullptr, TRUE, FALSE, nullptr));
 
   m_cursorDataEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
   m_shapeBuffer = new BYTE[512 * 512 * 4];
@@ -49,19 +47,27 @@ CSwapChainProcessor::CSwapChainProcessor(IDDCX_MONITOR monitor, CIndirectDeviceC
 
 CSwapChainProcessor::~CSwapChainProcessor()
 {
-  SetEvent(m_terminateEvent.Get());
-  if (m_thread[0].Get())
-    WaitForSingleObject(m_thread[0].Get(), INFINITE);
-  if (m_thread[1].Get())
-    WaitForSingleObject(m_thread[1].Get(), INFINITE);
-
-  /* IDDCX_SWAPCHAIN ownership: the driver owns the handle only if
-   * EvtIddCxMonitorAssignSwapChain returned success; the processing thread
-   * deletes it on exit (and clears m_hSwapChain), and the join above makes
-   * that visible here. If Start() failed, AssignSwapChain returns
-   * ABANDON_SWAPCHAIN and calls DisownSwapChain() first, because on a failure
-   * return IddCx deletes the swapchain itself -- deleting it here as well
-   * double-deletes the FxObject and crashes WUDFHost (Code 43). */
+  /* Runs when the LAST shared_ptr drops: every processing thread has already
+   * exited (each held a reference) AND the monitor context released its
+   * reference (Stop() + reset, or Start() failure). There is deliberately NO
+   * join and NO wait here — this can run inside an IddCx DDI callback, and
+   * IddCx's watchdog terminates WUDFHost when a callback overruns.
+   *
+   * IDDCX_SWAPCHAIN ownership: the driver owns the handle only if
+   * EvtIddCxMonitorAssignSwapChain returned success (if Start() failed,
+   * AssignSwapChain calls DisownSwapChain() and returns ABANDON, and IddCx
+   * deletes the swapchain itself). The owned handle is deleted HERE, when
+   * nothing can touch it anymore. Never delete it from a still-assigned
+   * state on the thread-exit path: deleting an ASSIGNED swapchain corrupts
+   * IddCx's internal lists when the subsequent monitor departure processes
+   * it (FAST_FAIL_CORRUPT_LIST_ENTRY in iddcx.dll). By last-reference time
+   * either the OS unassigned (monitor released after
+   * EvtIddCxMonitorUnassignSwapChain) or the monitor is being cleaned up. */
+  if (m_hSwapChain)
+  {
+    WdfObjectDelete((WDFOBJECT)m_hSwapChain);
+    m_hSwapChain = nullptr;
+  }
 
   if (m_dx12Device)
   {
@@ -72,34 +78,48 @@ CSwapChainProcessor::~CSwapChainProcessor()
   delete[] m_shapeBuffer;
 }
 
+void CSwapChainProcessor::Stop()
+{
+  /* signal-only; see the class comment. The threads observe the manual-reset
+   * latch (every loop iteration polls it, including between bring-up steps)
+   * and exit when their current — possibly tens-of-seconds — system call
+   * returns. */
+  SetEvent(m_terminateEvent.Get());
+}
+
 DWORD CALLBACK CSwapChainProcessor::_SwapChainThread(LPVOID arg)
 {
-  reinterpret_cast<CSwapChainProcessor*>(arg)->SwapChainThread();
+  auto* self = reinterpret_cast<std::shared_ptr<CSwapChainProcessor>*>(arg);
+  (*self)->SwapChainThread();
+  /* releasing this reference may destroy the processor right here */
+  delete self;
   return 0;
 }
 
 HRESULT CSwapChainProcessor::Start()
 {
-  HRESULT hr = SetSwapChainDevice();
-  if (FAILED(hr))
-  {
-    /* On the Helios pairing the FIRST swapchain of a boot arrives already
-     * abandoned (it was created against the initial render/indirect pairing
-     * instance, which dxgkrnl removes and re-creates during bring-up — the
-     * LUID churn — while DWM produces into the replacement swapchain).
-     * Verified 2026-07-02: DWM's presents complete through the blt queue at
-     * the same moment SetDevice fails ACCESS_LOST on the handed-in swapchain,
-     * and running the acquire loop on it anyway never yields a frame.
-     * Fail Start() so AssignSwapChain returns ABANDON_SWAPCHAIN: per the
-     * IddCx contract the OS then creates a NEW swapchain and calls
-     * AssignSwapChain again, which is the only path that can hand us the
-     * live instance. */
-    return hr;
-  }
-
-  m_thread[0].Attach(CreateThread(nullptr, 0, _SwapChainThread, this, 0, nullptr));
+  /* IddCxSwapChainSetDevice runs on the PROCESSING THREAD, never here.
+   * This method executes inside EvtIddCxMonitorAssignSwapChain, and a single
+   * SetDevice call was observed blocking 22+ seconds during boot pairing
+   * churn (2026-07-03 boots #2/#4) — holding the assign callback open that
+   * long is what let the framework's post-start deadline and the replug
+   * paths collide with a live callback (WUDFHost FAST_FAIL). Microsoft's
+   * IddCx sample binds the device on the processing thread for the same
+   * reason.
+   *
+   * The born-abandoned first swapchain of a boot (SetDevice fails
+   * DXGI_ERROR_ACCESS_LOST forever) is now handled by the thread's own
+   * SetDevice failure path: the thread self-exits and queues a monitor
+   * replug — the single recovery primitive — instead of returning
+   * ABANDON_SWAPCHAIN from the callback. Boot #3 (2026-07-03) demonstrated
+   * the replug loop self-converging to a fed steady-state binding. */
+  auto* self = new std::shared_ptr<CSwapChainProcessor>(shared_from_this());
+  m_thread[0].Attach(CreateThread(nullptr, 0, _SwapChainThread, self, 0, nullptr));
   if (!m_thread[0].Get())
+  {
+    delete self;
     return HRESULT_FROM_WIN32(GetLastError());
+  }
   return S_OK;
 }
 
@@ -111,8 +131,9 @@ void CSwapChainProcessor::SwapChainThread()
   DEBUG_INFO("Start Thread");
   const bool terminated = SwapChainThreadCore();
 
-  WdfObjectDelete((WDFOBJECT)m_hSwapChain);
-  m_hSwapChain = nullptr;
+  /* the swapchain object is deleted by the DESTRUCTOR, not here: at this
+   * point IddCx may still consider it assigned (self-exit on bring-up
+   * failure), and deleting an assigned swapchain corrupts IddCx state */
 
   AvRevertMmThreadCharacteristics(avTaskHandle);
 
@@ -123,6 +144,71 @@ void CSwapChainProcessor::SwapChainThread()
    * the LGMP timer / watchdog). */
   if (!terminated || InterlockedCompareExchange(&m_selfTerminated, 0, 0))
     m_devContext->NotifySwapChainSelfExit();
+}
+
+bool CSwapChainProcessor::InitDevices()
+{
+  /* runs on the processing thread; see the declaration comment. Failure
+   * returns false -> the thread self-exits -> NotifySwapChainSelfExit queues
+   * a monitor replug (the single recovery primitive). */
+  unsigned reInitAttempts = 0;
+reInit:
+  if (WaitForSingleObject(m_terminateEvent.Get(), 0) == WAIT_OBJECT_0)
+    return false;
+
+  m_dx11Device = std::make_shared<CD3D11Device>(m_renderAdapter);
+  HRESULT dx11hr = m_dx11Device->Init();
+  if (FAILED(dx11hr))
+  {
+    DEBUG_ERROR_HR(dx11hr, "InitDevices: CD3D11Device::Init FAILED (this gates the whole capture path)");
+    m_dx11Device.reset();
+    return false;
+  }
+  DEBUG_INFO("InitDevices: CD3D11Device::Init OK");
+
+  /* D3D11CreateDevice can block for many seconds during pairing churn; a
+   * Stop() may have arrived meanwhile — bail before further bring-up */
+  if (WaitForSingleObject(m_terminateEvent.Get(), 0) == WAIT_OBJECT_0)
+    return false;
+
+  UINT64 alignSize = CPlatformInfo::GetPageSize();
+  m_dx12Device = std::make_shared<CD3D12Device>(m_renderAdapter);
+  switch (m_dx12Device->Init(m_devContext->GetIVSHMEM(), alignSize))
+  {
+    case CD3D12Device::SUCCESS:
+      DEBUG_INFO("InitDevices: CD3D12Device::Init OK");
+      m_resPool.Init(m_dx11Device, m_dx12Device);
+      m_fbPool.Init(this);
+      if (!m_postProcessor.Init(m_dx12Device))
+        DEBUG_ERROR("Failed to initialize post processor");
+      break;
+
+    case CD3D12Device::FAILURE:
+      DEBUG_WARN("InitDevices: CD3D12Device::Init FAILURE; using D3D11 readback path");
+      m_dx12Device.reset();
+      alignSize = CPlatformInfo::GetPageSize();
+      break;
+
+    case CD3D12Device::RETRY:
+      DEBUG_INFO("InitDevices: CD3D12Device::Init RETRY");
+      m_dx12Device.reset();
+      m_dx11Device.reset();
+      if (++reInitAttempts >= 3)
+      {
+        DEBUG_ERROR("InitDevices: CD3D12Device::Init RETRY %u times, giving up "
+                    "(self-exit escalates to a monitor replug)", reInitAttempts);
+        return false;
+      }
+      goto reInit;
+  }
+
+  if (!m_devContext->SetupLGMP(alignSize))
+  {
+    DEBUG_ERROR("SetupLGMP failed");
+    return false;
+  }
+
+  return true;
 }
 
 HRESULT CSwapChainProcessor::SetSwapChainDevice()
@@ -153,6 +239,10 @@ HRESULT CSwapChainProcessor::SetSwapChainDevice()
   IDARG_IN_SWAPCHAINSETDEVICE setDevice = {};
   setDevice.pDevice = dxgiDevice.Get();
 
+  /* while inside IddCxSwapChainSetDevice no replug may depart the monitor
+   * (iddcx object teardown under a live call = list corruption failfast);
+   * NotifyBindingDone also restarts the stale-binding clock on success */
+  m_devContext->NotifyBindingStart();
   for (UINT attempt = 0; attempt < 5; ++attempt)
   {
     hr = IddCxSwapChainSetDevice(m_hSwapChain, &setDevice);
@@ -165,6 +255,7 @@ HRESULT CSwapChainProcessor::SetSwapChainDevice()
 
     Sleep(100);
   }
+  m_devContext->NotifyBindingDone();
   if (FAILED(hr))
   {
     DEBUG_ERROR_HR(hr, "IddCxSwapChainSetDevice Failed");
@@ -179,14 +270,28 @@ bool CSwapChainProcessor::SwapChainThreadCore()
 {
   HRESULT hr = S_OK;
 
+  if (!InitDevices())
+  {
+    /* a Stop() during bring-up is a NORMAL termination, not a self-exit —
+     * escalating it would queue a replug against whatever new binding
+     * superseded this one */
+    if (WaitForSingleObject(m_terminateEvent.Get(), 0) == WAIT_OBJECT_0)
+      return true;
+    DEBUG_ERROR("device bring-up failed on the swapchain thread; "
+                "exiting so the monitor lifecycle can replug");
+    return false;
+  }
+
   if (!m_swapChainDeviceSet)
   {
     hr = SetSwapChainDevice();
     if (FAILED(hr))
     {
+      if (WaitForSingleObject(m_terminateEvent.Get(), 0) == WAIT_OBJECT_0)
+        return true;
       /* an acquire loop with no bound device spins framelessly forever —
        * exit instead; the self-exit path escalates to a monitor replug */
-      DEBUG_ERROR_HR(hr, "SetSwapChainDevice still failing on the swapchain thread; "
+      DEBUG_ERROR_HR(hr, "SetSwapChainDevice failing on the swapchain thread; "
                          "exiting so the monitor lifecycle can replug");
       return false;
     }
@@ -220,7 +325,12 @@ bool CSwapChainProcessor::SwapChainThreadCore()
   }
 
   m_lastShapeId = 0;
-  m_thread[1].Attach(CreateThread(nullptr, 0, _CursorThread, this, 0, nullptr));
+  {
+    auto* cself = new std::shared_ptr<CSwapChainProcessor>(shared_from_this());
+    m_thread[1].Attach(CreateThread(nullptr, 0, _CursorThread, cself, 0, nullptr));
+    if (!m_thread[1].Get())
+      delete cself;
+  }
 
   // postpone sending this to ensure we dont spam messages if we end up in a
   // restart loop while waiting for a valid configuration
@@ -988,7 +1098,9 @@ bool CSwapChainProcessor::SwapChainNewFrame(ComPtr<IDXGIResource> acquiredBuffer
 
 DWORD CALLBACK CSwapChainProcessor::_CursorThread(LPVOID arg)
 {
-  reinterpret_cast<CSwapChainProcessor*>(arg)->CursorThread();
+  auto* self = reinterpret_cast<std::shared_ptr<CSwapChainProcessor>*>(arg);
+  (*self)->CursorThread();
+  delete self;
   return 0;
 }
 

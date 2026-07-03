@@ -87,6 +87,13 @@ private:
   volatile LONG m_unassignSeen    = 0; // OS confirmed the departure
   volatile LONG m_firstFrameSeen  = 0; // >=1 acquire since the last bind
   volatile LONG m_watchdogActive  = 0;
+  /* EvtIddCxMonitorAssignSwapChain is executing / the processor thread is
+   * inside IddCxSwapChainSetDevice. While either is set, ReplugMonitor
+   * DEFERS: departing the monitor makes IddCx tear down its objects under
+   * the running call — observed as FAST_FAIL_CORRUPT_LIST_ENTRY (0xc0000409
+   * data=7) at iddcx.dll+0xa631 killing WUDFHost (boot #4, 2026-07-03). */
+  volatile LONG m_assignInFlight  = 0;
+  volatile LONG m_bindingInFlight = 0;
   bool          m_renderAdapterSelected = false; // latch: issue once per adapter
   WDFTIMER      m_watchdogTimer = nullptr;
 
@@ -181,6 +188,16 @@ public:
   void OnUnassignedSwapChain();
   void OnSwapChainLost();
   void OnSwapChainDeviceLost();
+
+  /* brackets the EvtIddCxMonitorAssignSwapChain callback (Device.cpp) */
+  void AssignCallbackEnter();
+  void AssignCallbackExit();
+
+  /* brackets the processor thread's IddCxSwapChainSetDevice attempts; Done
+   * restarts the first-frame (stale-binding) clock so it measures from the
+   * moment the device was actually bound, not from the assignment */
+  void NotifyBindingStart();
+  void NotifyBindingDone();
 
   /* called by CSwapChainProcessor on every successful buffer acquire —
    * disarms the first-frame (stale-binding) watchdog for this binding */

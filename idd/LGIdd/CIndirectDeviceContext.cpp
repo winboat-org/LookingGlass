@@ -411,6 +411,21 @@ void CIndirectDeviceContext::FinishInit(UINT connectorIndex)
  * monitor then never returned and every future replug no-op'd.) */
 void CIndirectDeviceContext::ReplugMonitor()
 {
+  /* NEVER depart a monitor while an AssignSwapChain callback is executing or
+   * the processor thread is inside IddCxSwapChainSetDevice: IddCx then tears
+   * down its swapchain/monitor objects under the running call, corrupting its
+   * internal lists — FAST_FAIL_CORRUPT_LIST_ENTRY (0xc0000409, data=7) at
+   * iddcx.dll+0xa631, WUDFHost terminated, devnode FAILED_POST_START
+   * (boot #4, 2026-07-03). Defer instead: every caller class self-retries
+   * (the watchdog re-evaluates its condition on the next tick; LGMP-queued
+   * requests are superseded by the very assignment that is in flight). */
+  if (InterlockedCompareExchange(&m_assignInFlight, 0, 0) ||
+      InterlockedCompareExchange(&m_bindingInFlight, 0, 0))
+  {
+    DEBUG_INFO("ReplugMonitor deferred: swapchain assignment/binding in flight");
+    return;
+  }
+
   EnterCriticalSection(&m_stateLock);
 
   if ((MonitorState)m_monitorState == MonitorState::ReplugPending)
@@ -507,6 +522,8 @@ void CIndirectDeviceContext::MonitorWatchdog()
 void CIndirectDeviceContext::OnAssignSwapChain()
 {
   InterlockedExchange(&m_recoverModeUpdateSwapChain, 0);
+  /* a fresh assignment supersedes any queued replug */
+  InterlockedExchange(&m_replugMonitorQueued, 0);
 
   EnterCriticalSection(&m_stateLock);
   InterlockedExchange(&m_firstFrameSeen, 0);
@@ -552,6 +569,34 @@ void CIndirectDeviceContext::NotifySwapChainSelfExit()
     return;
 
   DEBUG_WARN("Swapchain processor exited without a terminate request, queueing monitor replug");
+}
+
+void CIndirectDeviceContext::AssignCallbackEnter()
+{
+  InterlockedExchange(&m_assignInFlight, 1);
+}
+
+void CIndirectDeviceContext::AssignCallbackExit()
+{
+  InterlockedExchange(&m_assignInFlight, 0);
+}
+
+void CIndirectDeviceContext::NotifyBindingStart()
+{
+  InterlockedExchange(&m_bindingInFlight, 1);
+}
+
+void CIndirectDeviceContext::NotifyBindingDone()
+{
+  InterlockedExchange(&m_bindingInFlight, 0);
+
+  /* the stale-binding (first-frame) timeout measures from the moment the
+   * device was bound to the swapchain — binding attempts themselves can
+   * legitimately take tens of seconds during boot pairing churn */
+  EnterCriticalSection(&m_stateLock);
+  if ((MonitorState)m_monitorState == MonitorState::SwapChainBound)
+    m_stateEnteredTick = GetTickCount64();
+  LeaveCriticalSection(&m_stateLock);
 }
 
 void CIndirectDeviceContext::OnSwapChainLost()
