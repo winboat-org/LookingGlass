@@ -467,9 +467,16 @@ bool CSwapChainProcessor::SwapChainThreadCore()
       pendingPolls = 0;
       /* disarm the first-frame (stale-binding) watchdog for this binding */
       m_devContext->NotifyFrameAcquired();
+      /* gate ReplugMonitor while this frame is outstanding: a monitor
+       * departure between acquire and FinishedProcessingFrame destroys the
+       * child swapchain with the frame unreleased and IddCx kills the host
+       * process (DriverDidNotReleaseFrame). Paired with NotifyFrameReleased
+       * immediately after the Finish attempt on every path below. */
+      m_devContext->NotifyFrameHeld();
       if (!m_dx12Device && !useSystemBuffer)
       {
         hr = FinishProcessingFrame("d3d11-acquired-immediate");
+        m_devContext->NotifyFrameReleased();
         if (FAILED(hr))
         {
           if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
@@ -498,6 +505,7 @@ bool CSwapChainProcessor::SwapChainThreadCore()
       if (!frameAlreadyFinished)
       {
         hr = FinishProcessingFrame("main-loop");
+        m_devContext->NotifyFrameReleased();
         if (FAILED(hr))
         {
           if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)

@@ -94,6 +94,15 @@ private:
    * data=7) at iddcx.dll+0xa631 killing WUDFHost (boot #4, 2026-07-03). */
   volatile LONG m_assignInFlight  = 0;
   volatile LONG m_bindingInFlight = 0;
+  /* nonzero while the processor thread is between a successful
+   * ReleaseAndAcquireBuffer and IddCxSwapChainFinishedProcessingFrame.
+   * Departing the monitor then destroys the child swapchain with the frame
+   * outstanding and IddCx kills the host process
+   * (ReportBugcheckForSwapChainTimeoutDriverDidNotReleaseFrame — observed
+   * 2026-07-03 10:25:52Z, dump WUDFHost.exe-(PID-8464)). ReplugMonitor
+   * defers while this is set; the hold window is tiny, so retries succeed
+   * within a watchdog/LGMP tick. */
+  volatile LONG m_frameHeld       = 0;
   bool          m_renderAdapterSelected = false; // latch: issue once per adapter
   WDFTIMER      m_watchdogTimer = nullptr;
 
@@ -202,6 +211,12 @@ public:
   /* called by CSwapChainProcessor on every successful buffer acquire —
    * disarms the first-frame (stale-binding) watchdog for this binding */
   void NotifyFrameAcquired();
+
+  /* brackets the processor thread's acquire → FinishedProcessingFrame
+   * window; ReplugMonitor must not depart the monitor while a frame is
+   * outstanding (see m_frameHeld) */
+  void NotifyFrameHeld();
+  void NotifyFrameReleased();
 
   /* called by CSwapChainProcessor when its processing thread exits for any
    * reason other than a normal terminate request — the swapchain is dead but

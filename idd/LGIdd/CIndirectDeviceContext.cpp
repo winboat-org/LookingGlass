@@ -426,6 +426,24 @@ void CIndirectDeviceContext::ReplugMonitor()
     return;
   }
 
+  /* NEVER depart a monitor while the processor thread holds an acquired
+   * frame: departure destroys the child swapchain with the frame outstanding
+   * and IddCx bugchecks the host process for the unreleased frame
+   * (ReportBugcheckForSwapChainTimeoutDriverDidNotReleaseFrame — observed
+   * 2026-07-03 10:25:52Z, dump WUDFHost.exe-(PID-8464), self-recovered).
+   * The hold window (acquire → FinishedProcessingFrame) is tiny; re-queue so
+   * the LGMP timer retries next tick (ProcessLGMP consumed the queued flag
+   * before calling here), and watchdog-driven callers re-evaluate on their
+   * own tick. Like the gates above this narrows the race to instants rather
+   * than eliminating it — IddCx itself surfaces a departure-vs-acquire
+   * collision as ACCESS_LOST on the acquire, which escalates to replug. */
+  if (InterlockedCompareExchange(&m_frameHeld, 0, 0))
+  {
+    DEBUG_INFO("ReplugMonitor deferred: acquired frame in flight");
+    InterlockedExchange(&m_replugMonitorQueued, 1);
+    return;
+  }
+
   EnterCriticalSection(&m_stateLock);
 
   if ((MonitorState)m_monitorState == MonitorState::ReplugPending)
@@ -561,6 +579,16 @@ void CIndirectDeviceContext::OnUnassignedSwapChain()
 void CIndirectDeviceContext::NotifyFrameAcquired()
 {
   InterlockedExchange(&m_firstFrameSeen, 1);
+}
+
+void CIndirectDeviceContext::NotifyFrameHeld()
+{
+  InterlockedIncrement(&m_frameHeld);
+}
+
+void CIndirectDeviceContext::NotifyFrameReleased()
+{
+  InterlockedDecrement(&m_frameHeld);
 }
 
 void CIndirectDeviceContext::NotifySwapChainSelfExit()
