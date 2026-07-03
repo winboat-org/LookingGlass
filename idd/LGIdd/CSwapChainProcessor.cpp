@@ -298,6 +298,10 @@ bool CSwapChainProcessor::SwapChainThreadCore()
     }
   }
 
+  /* device bring-up complete: only from here may the first-frame watchdog
+   * count zero acquires against this binding */
+  m_devContext->NotifyDevicesReady();
+
   BOOL swapChainInSystemMemory = FALSE;
   if (!m_dx12Device)
   {

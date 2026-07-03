@@ -47,13 +47,24 @@ static const UINT IDDCX_VERSION_1_10 = 0x1A00;
 
 /* C5 monitor-lifecycle watchdog periods (ms). Every state has an exit:
  * NoMonitor      → re-run FinishInit after NOMONITOR_RETRY_MS
- * Arrived        → replug if no AssignSwapChain within OFFER_TIMEOUT_MS
- * SwapChainBound → replug if the fresh binding never acquires a single frame
- *                  within FIRSTFRAME_TIMEOUT_MS (a topology transition always
- *                  redraws at least once, so zero acquires after a bind means
- *                  dwm is feeding a different pairing instance — a stale
- *                  binding; once one frame has arrived the watchdog disarms,
- *                  because an idle desktop legitimately presents nothing)
+ * Arrived        → replug if no AssignSwapChain within the offer window.
+ *                  The window BACKS OFF exponentially with consecutive
+ *                  fruitless replugs (10/20/40/80 s, reset by a real acquired
+ *                  frame): dwm needs 10 s+ to rebuild composition after churn,
+ *                  and replugging mid-rebuild restarts that clock — a fixed
+ *                  10 s window livelocks the pairing (observed 2026-07-04).
+ * SwapChainBound → two sub-cases:
+ *                  (1) no frame yet: replug if zero acquires within
+ *                  FIRSTFRAME_TIMEOUT_MS measured from DEVICE-READY (the
+ *                  processor's D3D bring-up on a churning venus stack takes
+ *                  10-15 s; measuring from bind killed legitimate pairings),
+ *                  with DEVICEINIT_TIMEOUT_MS as the absolute cap in case the
+ *                  device init itself never completes.
+ *                  (2) after the first frame: a previously-flowing binding
+ *                  whose acquires stop for MIDSTREAM_STALL_MS gets ONE replug
+ *                  (per binding) — covers dwm feeding an orphaned swapchain
+ *                  instance after a WUDFHost restart; the once-per-binding
+ *                  latch bounds the cost of an idle-desktop false positive.
  * ReplugPending  → re-run FinishInit when the OS confirms the departure
  *                  (UnassignSwapChain) OR unconditionally after
  *                  REPLUG_SETTLE_MS — the OS only calls UnassignSwapChain if
@@ -64,6 +75,9 @@ static const ULONGLONG NOMONITOR_RETRY_MS   = 5000;
 static const ULONGLONG OFFER_TIMEOUT_MS     = 10000;
 static const ULONGLONG FIRSTFRAME_TIMEOUT_MS = 10000;
 static const ULONGLONG REPLUG_SETTLE_MS     = 1000;
+static const ULONGLONG DEVICEINIT_TIMEOUT_MS = 45000;
+static const ULONGLONG MIDSTREAM_STALL_MS   = 45000;
+static const LONG      OFFER_BACKOFF_MAX_SHIFT = 3;
 
 void CIndirectDeviceContext::EnterState(MonitorState s)
 {
@@ -317,6 +331,7 @@ void CIndirectDeviceContext::SelectRenderAdapter()
         adapterDesc.Description, preferHelios ? 1 : 0);
       selectedRenderAdapter = true;
       m_renderAdapterSelected = true;
+      m_selectedRenderAdapterLuid = adapterDesc.AdapterLuid;
       break;
     }
     factory->Release();
@@ -326,6 +341,49 @@ void CIndirectDeviceContext::SelectRenderAdapter()
 
   if (!selectedRenderAdapter)
     DEBUG_WARN("Render-adapter preference NOT registered; IddCx render adapter remains OS-selected");
+}
+
+/* The render-adapter preference latch is adapter-instance-scoped, but the
+ * RENDER adapter can be PnP-restarted underneath us (every Helios UMD/KMD
+ * hotplug deploy does this), minting a new LUID. The latched preference then
+ * names a dead adapter and the OS can never build the swapchain pairing —
+ * observed 2026-07-04 as an endless no-AssignSwapChain replug loop after a
+ * deploy. Called from the watchdog only when pairing is already failing, so
+ * the enumeration cost stays off the happy path. */
+void CIndirectDeviceContext::RevalidateRenderAdapter()
+{
+  if (!m_renderAdapterSelected)
+    return;
+
+  IDXGIFactory * factory = NULL;
+  if (FAILED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void **)&factory)))
+    return;
+
+  bool stillPresent = false;
+  IDXGIAdapter * dxgiAdapter;
+  for (UINT i = 0; factory->EnumAdapters(i, &dxgiAdapter) != DXGI_ERROR_NOT_FOUND; ++i)
+  {
+    DXGI_ADAPTER_DESC adapterDesc;
+    dxgiAdapter->GetDesc(&adapterDesc);
+    dxgiAdapter->Release();
+    if (adapterDesc.AdapterLuid.HighPart == m_selectedRenderAdapterLuid.HighPart &&
+        adapterDesc.AdapterLuid.LowPart  == m_selectedRenderAdapterLuid.LowPart)
+    {
+      stillPresent = true;
+      break;
+    }
+  }
+  factory->Release();
+
+  if (stillPresent)
+    return;
+
+  DEBUG_WARN("Latched render adapter LUID %08x:%08x no longer exists "
+             "(render adapter restarted?) — re-selecting",
+             (unsigned)m_selectedRenderAdapterLuid.HighPart,
+             (unsigned)m_selectedRenderAdapterLuid.LowPart);
+  m_renderAdapterSelected = false;
+  SelectRenderAdapter();
 }
 
 void CIndirectDeviceContext::FinishInit(UINT connectorIndex)
@@ -505,20 +563,71 @@ void CIndirectDeviceContext::MonitorWatchdog()
       break;
 
     case MonitorState::Arrived:
-      if (elapsed >= OFFER_TIMEOUT_MS)
+    {
+      const LONG fruitless = InterlockedCompareExchange(&m_fruitlessReplugs, 0, 0);
+      const ULONGLONG offerWindow =
+        OFFER_TIMEOUT_MS << min(fruitless, OFFER_BACKOFF_MAX_SHIFT);
+      if (elapsed >= offerWindow)
       {
-        DEBUG_WARN("Watchdog: monitor arrived but no AssignSwapChain within %llums, replugging", elapsed);
+        DEBUG_WARN("Watchdog: monitor arrived but no AssignSwapChain within %llums "
+                   "(window %llums, fruitless replugs %ld), replugging",
+                   elapsed, offerWindow, fruitless);
+        /* a fruitless offer often means the latched render adapter LUID died
+         * (Helios PnP restart) — re-issue the preference before replugging */
+        RevalidateRenderAdapter();
+        InterlockedIncrement(&m_fruitlessReplugs);
         ReplugMonitor();
       }
       break;
+    }
 
     case MonitorState::SwapChainBound:
-      if (!InterlockedCompareExchange(&m_firstFrameSeen, 0, 0) &&
-          elapsed >= FIRSTFRAME_TIMEOUT_MS)
+      if (!InterlockedCompareExchange(&m_firstFrameSeen, 0, 0))
       {
-        DEBUG_WARN("Watchdog: swapchain bound but zero frames acquired within %llums "
-                   "(stale binding), replugging", elapsed);
-        ReplugMonitor();
+        /* NotifyDevicesReady refreshes m_stateEnteredTick, so `elapsed` counts
+         * from device-ready once the processor's D3D bring-up completed; until
+         * then only the absolute init cap applies. */
+        const bool devicesReady =
+          InterlockedCompareExchange(&m_devicesReady, 0, 0) != 0;
+        if (!devicesReady && elapsed >= DEVICEINIT_TIMEOUT_MS)
+        {
+          DEBUG_WARN("Watchdog: swapchain bound but device bring-up incomplete after "
+                     "%llums, replugging", elapsed);
+          InterlockedIncrement(&m_fruitlessReplugs);
+          ReplugMonitor();
+        }
+        else if (devicesReady && elapsed >= FIRSTFRAME_TIMEOUT_MS)
+        {
+          DEBUG_WARN("Watchdog: devices ready but zero frames acquired within %llums "
+                     "(stale binding), replugging", elapsed);
+          InterlockedIncrement(&m_fruitlessReplugs);
+          ReplugMonitor();
+        }
+      }
+      else
+      {
+        /* mid-stream stall DETECTION ONLY: an idle desktop legitimately
+         * presents nothing for minutes, so zero acquires is NOT a reliable
+         * failure signal from this side and auto-replugging here destroys
+         * healthy bindings (false-positived live 2026-07-04 within minutes
+         * of deploy). The actual mid-stream stall causes are handled where
+         * they are observable: a wedged dwm now gets DEVICE_LOST from the
+         * ICD's forward-progress deadline and restarts itself, and an
+         * abandoned swapchain surfaces as ACCESS_LOST in the processor
+         * (OnSwapChainDeviceLost → replug). Keep the loud breadcrumb (once
+         * per binding) so a genuine unrecovered stall class shows up in the
+         * log with timing evidence. */
+        const LONGLONG lastAcquire =
+          InterlockedCompareExchange64(&m_lastAcquireTick, 0, 0);
+        const ULONGLONG now = GetTickCount64();
+        if (!InterlockedCompareExchange(&m_midstreamReplugged, 0, 0) &&
+            lastAcquire > 0 && now - (ULONGLONG)lastAcquire >= MIDSTREAM_STALL_MS)
+        {
+          DEBUG_WARN("Watchdog: no acquires for %llums on a previously-flowing binding "
+                     "(idle desktop OR a genuine stall; not replugging)",
+                     now - (ULONGLONG)lastAcquire);
+          InterlockedExchange(&m_midstreamReplugged, 1);
+        }
       }
       break;
 
@@ -545,6 +654,8 @@ void CIndirectDeviceContext::OnAssignSwapChain()
 
   EnterCriticalSection(&m_stateLock);
   InterlockedExchange(&m_firstFrameSeen, 0);
+  InterlockedExchange(&m_devicesReady, 0);
+  InterlockedExchange(&m_midstreamReplugged, 0);
   EnterState(MonitorState::SwapChainBound);
   LeaveCriticalSection(&m_stateLock);
 
@@ -579,6 +690,23 @@ void CIndirectDeviceContext::OnUnassignedSwapChain()
 void CIndirectDeviceContext::NotifyFrameAcquired()
 {
   InterlockedExchange(&m_firstFrameSeen, 1);
+  InterlockedExchange64(&m_lastAcquireTick, (LONGLONG)GetTickCount64());
+  /* a real frame is the only true success signal: reset the replug backoff
+   * and re-arm the (once-per-binding) mid-stream stall watchdog */
+  InterlockedExchange(&m_fruitlessReplugs, 0);
+  InterlockedExchange(&m_midstreamReplugged, 0);
+}
+
+void CIndirectDeviceContext::NotifyDevicesReady()
+{
+  InterlockedExchange(&m_devicesReady, 1);
+  /* start the first-frame window from device-ready, not from the bind: the
+   * processor's D3D bring-up can take 10-15 s under venus churn and the
+   * watchdog must not count that against the binding */
+  EnterCriticalSection(&m_stateLock);
+  if ((MonitorState)m_monitorState == MonitorState::SwapChainBound)
+    m_stateEnteredTick = GetTickCount64();
+  LeaveCriticalSection(&m_stateLock);
 }
 
 void CIndirectDeviceContext::NotifyFrameHeld()

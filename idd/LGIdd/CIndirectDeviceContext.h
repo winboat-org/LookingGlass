@@ -87,6 +87,16 @@ private:
   volatile LONG m_unassignSeen    = 0; // OS confirmed the departure
   volatile LONG m_firstFrameSeen  = 0; // >=1 acquire since the last bind
   volatile LONG m_watchdogActive  = 0;
+  /* processor D3D bring-up completed for the current binding — the
+   * first-frame watchdog window only starts counting from this point */
+  volatile LONG m_devicesReady    = 0;
+  /* consecutive replugs with no acquired frame since — drives the offer
+   * window's exponential backoff; reset by NotifyFrameAcquired */
+  volatile LONG m_fruitlessReplugs = 0;
+  /* once-per-binding latch for the mid-stream acquire-stall replug */
+  volatile LONG m_midstreamReplugged = 0;
+  /* GetTickCount64 of the last acquired frame (0 = none this binding) */
+  volatile LONG64 m_lastAcquireTick = 0;
   /* EvtIddCxMonitorAssignSwapChain is executing / the processor thread is
    * inside IddCxSwapChainSetDevice. While either is set, ReplugMonitor
    * DEFERS: departing the monitor makes IddCx tear down its objects under
@@ -104,6 +114,9 @@ private:
    * within a watchdog/LGMP tick. */
   volatile LONG m_frameHeld       = 0;
   bool          m_renderAdapterSelected = false; // latch: issue once per adapter
+  /* the LUID the latched preference named — revalidated on fruitless replugs
+   * because a Helios PnP restart mints a new LUID and orphans the pairing */
+  LUID          m_selectedRenderAdapterLuid = {};
   WDFTIMER      m_watchdogTimer = nullptr;
 
   void EnterState(MonitorState s);
@@ -189,6 +202,7 @@ public:
   void PopulateDefaultModes();
   void InitAdapter();
   void SelectRenderAdapter();
+  void RevalidateRenderAdapter();
   void FinishInit(UINT connectorIndex);
   void ReplugMonitor();
   void MonitorWatchdog();
@@ -211,6 +225,7 @@ public:
   /* called by CSwapChainProcessor on every successful buffer acquire —
    * disarms the first-frame (stale-binding) watchdog for this binding */
   void NotifyFrameAcquired();
+  void NotifyDevicesReady();
 
   /* brackets the processor thread's acquire → FinishedProcessingFrame
    * window; ReplugMonitor must not depart the monitor while a frame is
