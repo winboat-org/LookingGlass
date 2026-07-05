@@ -190,10 +190,19 @@ bool CSwapChainProcessor::InitDevices()
   /* runs on the processing thread; see the declaration comment. Failure
    * returns false -> the thread self-exits -> NotifySwapChainSelfExit queues
    * a monitor replug (the single recovery primitive). */
+  m_forceFullDamage = g_settings.ReadBoolValue(L"HeliosForceFullDamage", false);
+  if (m_forceFullDamage)
+    DEBUG_INFO("HeliosForceFullDamage=1: dirty rects ignored, full-frame copy+damage every frame");
+
   unsigned reInitAttempts = 0;
 reInit:
   if (WaitForSingleObject(m_terminateEvent.Get(), 0) == WAIT_OBJECT_0)
     return false;
+
+  /* the staging texture belongs to the D3D11 device built below — never carry
+   * one across a device (re)build (the RETRY arm re-enters here) */
+  m_d11Staging.Reset();
+  m_d11StagingDesc = {};
 
   m_dx11Device = std::make_shared<CD3D11Device>(m_renderAdapter);
   HRESULT dx11hr = m_dx11Device->Init();
@@ -505,7 +514,6 @@ bool CSwapChainProcessor::SwapChainThreadCore()
     }
     else if (SUCCEEDED(hr))
     {
-      bool frameAlreadyFinished = false;
       pendingPolls = 0;
       /* disarm the first-frame (stale-binding) watchdog for this binding */
       m_devContext->NotifyFrameAcquired();
@@ -515,28 +523,30 @@ bool CSwapChainProcessor::SwapChainThreadCore()
        * process (DriverDidNotReleaseFrame). Paired with NotifyFrameReleased
        * immediately after the Finish attempt on every path below. */
       m_devContext->NotifyFrameHeld();
-      if (!m_dx12Device && !useSystemBuffer)
-      {
-        hr = FinishProcessingFrame("d3d11-acquired-immediate");
-        m_devContext->NotifyFrameReleased();
-        if (FAILED(hr))
-        {
-          if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
-            m_devContext->OnSwapChainLost();
-          break;
-        }
-        frameAlreadyFinished = true;
-      }
+      /* the D3D11 readback path previously finished the frame here
+       * ("d3d11-acquired-immediate"), releasing the buffer at CopyResource
+       * SUBMIT time — dwm could then re-render into it before the copy
+       * executed on the host GPU, so the delivered content ran newer than
+       * the dirty rects (persistent ghosts once motion stopped). The frame
+       * is now finished by the post-processing block below, after the
+       * staging Map has completed. Cycle time is unchanged: this thread
+       * already blocked on the Map before the next acquire. */
       if (frameNumber != lastFrameNumber)
       {
         lastFrameNumber = frameNumber;
+        /* HeliosForceFullDamage: a count above LG_MAX_DIRTY_RECTS takes each
+         * frame path's existing overflow branch — SetFullDamage()/full rect —
+         * so both the staging copy and the KVMFR damage rects cover the whole
+         * frame (see the member comment in CSwapChainProcessor.h) */
+        if (m_forceFullDamage)
+          dirtyRectCount = LG_MAX_DIRTY_RECTS + 1;
         if (useSystemBuffer)
           SwapChainNewFrameSystem(sysBuffer, dirtyRectCount);
         else if (!m_dx12Device)
         {
           DEBUG_TRACE("D3D11 fallback acquired frame=%u dirty=%u surface=%p",
             frameNumber, dirtyRectCount, surface.Get());
-          SwapChainNewFrameD3D11(surface, dirtyRectCount, true);
+          SwapChainNewFrameD3D11(surface, dirtyRectCount);
           surface.Reset();
         }
         else
@@ -544,16 +554,15 @@ bool CSwapChainProcessor::SwapChainThreadCore()
       }
 
       // report that all GPU processing for this frame has been queued
-      if (!frameAlreadyFinished)
+      // (on the D3D11 readback path this runs after the staging Map, so the
+      // buffer is only handed back once its content has been captured)
+      hr = FinishProcessingFrame("main-loop");
+      m_devContext->NotifyFrameReleased();
+      if (FAILED(hr))
       {
-        hr = FinishProcessingFrame("main-loop");
-        m_devContext->NotifyFrameReleased();
-        if (FAILED(hr))
-        {
-          if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
-            m_devContext->OnSwapChainLost();
-          break;
-        }
+        if (hr == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY)
+          m_devContext->OnSwapChainLost();
+        break;
       }
     }
     else
@@ -773,22 +782,26 @@ bool CSwapChainProcessor::SwapChainNewFrameSystem(const IDDCX_SYSTEM_BUFFER_INFO
   return true;
 }
 
-bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount, bool frameAlreadyReleased)
+bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount)
 {
-  bool finished = frameAlreadyReleased;
-  auto finishAcquiredFrame = [&](const char * reason) -> bool
+  /* the CALLER owns FinishProcessingFrame and issues it after this returns —
+   * the acquired buffer must stay unreleased until the staging Map completes
+   * (see the declaration comment); every early return below therefore just
+   * returns and lets the main loop finish the frame */
+
+  LARGE_INTEGER qpcFreq;
+  QueryPerformanceFrequency(&qpcFreq);
+  auto nowUs = [&]() -> LONGLONG
   {
-    if (finished)
-      return true;
-    HRESULT finishHr = FinishProcessingFrame(reason);
-    finished = SUCCEEDED(finishHr);
-    return finished;
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart * 1000000ll / qpcFreq.QuadPart;
   };
+  const LONGLONG tEnter = nowUs();
 
   if (!acquiredBuffer)
   {
     DEBUG_ERROR("D3D11 fallback acquired a null buffer");
-    finishAcquiredFrame("d3d11-null-buffer");
     return false;
   }
 
@@ -798,7 +811,6 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   if (FAILED(hr))
   {
     DEBUG_ERROR_HR(hr, "Failed to obtain the ID3D11Texture2D from the acquiredBuffer");
-    finishAcquiredFrame("d3d11-as-failed");
     return false;
   }
 
@@ -812,7 +824,6 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   if (frameType == FRAME_TYPE_INVALID)
   {
     DEBUG_ERROR("Unsupported D3D11 fallback frame format 0x%x", desc.Format);
-    finishAcquiredFrame("d3d11-bad-format");
     return false;
   }
 
@@ -862,46 +873,56 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
       nbDirtyRects = dirtyOut.DirtyRectOutCount;
   }
   ClipDirtyRects(dirtyRects, &nbDirtyRects, frameFormat.desc);
+  const LONGLONG tRects = nowUs();
 
-  D3D11_TEXTURE2D_DESC stagingDesc = desc;
-  stagingDesc.BindFlags = 0;
-  stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  stagingDesc.MiscFlags = 0;
-  stagingDesc.Usage = D3D11_USAGE_STAGING;
-
-  ComPtr<ID3D11Texture2D> staging;
-  DEBUG_TRACE("D3D11 fallback: CreateTexture2D staging");
-  hr = m_dx11Device->GetBaseDevice()->CreateTexture2D(&stagingDesc, nullptr, &staging);
-  if (FAILED(hr))
+  if (!m_d11Staging ||
+      m_d11StagingDesc.Width  != desc.Width  ||
+      m_d11StagingDesc.Height != desc.Height ||
+      m_d11StagingDesc.Format != desc.Format)
   {
-    DEBUG_ERROR_HR(hr, "Failed to create D3D11 staging texture");
-    finishAcquiredFrame("d3d11-create-staging-failed");
-    return false;
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+
+    m_d11Staging.Reset();
+    DEBUG_TRACE("D3D11 fallback: CreateTexture2D staging");
+    hr = m_dx11Device->GetBaseDevice()->CreateTexture2D(&stagingDesc, nullptr, &m_d11Staging);
+    if (FAILED(hr))
+    {
+      DEBUG_ERROR_HR(hr, "Failed to create D3D11 staging texture");
+      return false;
+    }
+    m_d11StagingDesc = stagingDesc;
+    ++m_d11Stats.stagingRecreates;
   }
+  ID3D11Texture2D * staging = m_d11Staging.Get();
+  const LONGLONG tStaging = nowUs();
 
   auto context = m_dx11Device->GetBaseContext();
   DEBUG_TRACE("D3D11 fallback: CopyResource staging<-swapchain");
-  context->CopyResource(staging.Get(), texture.Get());
-  if (!finishAcquiredFrame("d3d11-staging-copy-submitted"))
-    return false;
+  context->CopyResource(staging, texture.Get());
 
   acquiredBuffer.Reset();
   texture.Reset();
+  const LONGLONG tCopy = nowUs();
 
   D3D11_MAPPED_SUBRESOURCE mapped = {};
   DEBUG_TRACE("D3D11 fallback: Map staging");
-  hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+  hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
   if (FAILED(hr))
   {
     DEBUG_ERROR_HR(hr, "Failed to map D3D11 staging texture");
     return false;
   }
+  const LONGLONG tMap = nowUs();
 
   auto buffer = m_devContext->PrepareFrameBuffer(mapped.RowPitch, frameFormat, frameFormat, dirtyRects, nbDirtyRects);
   if (!buffer.mem)
   {
     DEBUG_ERROR("Failed to prepare D3D11 fallback frame buffer");
-    context->Unmap(staging.Get(), 0);
+    context->Unmap(staging, 0);
     return false;
   }
 
@@ -945,12 +966,46 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
     if (buffer.pitch > copyBytes)
       memset(dst + row * buffer.pitch + copyBytes, 0, buffer.pitch - copyBytes);
   }
-  context->Unmap(staging.Get(), 0);
+  context->Unmap(staging, 0);
+  const LONGLONG tMemcpy = nowUs();
 
   m_devContext->FinalizeFrameBuffer(buffer.frameIndex, rows * buffer.pitch);
   m_devContext->PresentHeliosFrame(buffer.frameIndex);
   memcpy(m_dirtyRects, dirtyRects, nbDirtyRects * sizeof(*m_dirtyRects));
   m_nbDirtyRects = nbDirtyRects;
+  const LONGLONG tLgmp = nowUs();
+
+  /* per-stage aggregate: the swapchain thread is fully serialized, so these
+   * stages ARE the delivered frame rate — one INFO line per 300 frames */
+  {
+    auto & s = m_d11Stats;
+    if (s.frames == 0)
+      s.windowStart = tEnter;
+    const LONGLONG gap = s.lastFrameEnd ? tEnter - s.lastFrameEnd : 0;
+    s.lastFrameEnd = tLgmp;
+    s.rects       += tRects   - tEnter;
+    s.staging     += tStaging - tRects;
+    s.copy        += tCopy    - tStaging;
+    s.map         += tMap     - tCopy;
+    s.memcpyKvmfr += tMemcpy  - tMap;
+    s.lgmp        += tLgmp    - tMemcpy;
+    s.gap         += gap;
+    if (tMap - tCopy > s.mapMax) s.mapMax = tMap - tCopy;
+    if (gap > s.gapMax)          s.gapMax = gap;
+    if (++s.frames >= 300)
+    {
+      const double windowSec = (double)(tLgmp - s.windowStart) / 1e6;
+      DEBUG_INFO("D3D11 path stats: %.1f fps over %.1fs | us avg: rects=%lld staging=%lld "
+                 "copy=%lld map=%lld (max %lld) memcpy=%lld lgmp=%lld gap=%lld (max %lld) "
+                 "| staging recreates=%u",
+        s.frames / windowSec, windowSec,
+        s.rects / s.frames, s.staging / s.frames, s.copy / s.frames,
+        s.map / s.frames, s.mapMax, s.memcpyKvmfr / s.frames, s.lgmp / s.frames,
+        s.gap / s.frames, s.gapMax, s.stagingRecreates);
+      memset(&s, 0, sizeof(s));
+      s.lastFrameEnd = tLgmp;
+    }
+  }
 
   const LONG frames = InterlockedIncrement(&m_systemFrameCount);
   if (frames == 1 || (frames % 30) == 0)

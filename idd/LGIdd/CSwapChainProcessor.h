@@ -71,6 +71,14 @@ private:
 
   RECT     m_dirtyRects[LG_MAX_DIRTY_RECTS] = {};
   unsigned m_nbDirtyRects = 0;
+  /* HKLM\SOFTWARE\LookingGlass\IDD!HeliosForceFullDamage — when set, every
+   * acquired frame is treated as fully damaged: full-frame GPU copy AND
+   * full-frame KVMFR damage, bypassing IddCx's cumulative per-buffer dirty
+   * rects entirely. Diagnostic lever for ghosting suspected to be dirty-rect
+   * misattribution (Helios flip-identity rotation vs dxgkrnl bookkeeping);
+   * read once per swapchain bring-up (InitDevices) — toggle takes effect on
+   * IDD device restart / monitor replug. */
+  bool     m_forceFullDamage = false;
   LONG     m_copyBusyDrops = 0;
   LONG     m_systemFrameCount = 0;
   LONG     m_systemAcquireFailures = 0;
@@ -108,7 +116,31 @@ private:
   HRESULT FinishProcessingFrame(const char * reason);
   bool SwapChainNewFrame(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount);
   bool SwapChainNewFrameSystem(const IDDCX_SYSTEM_BUFFER_INFO& sysBuffer, unsigned dirtyRectCount);
-  bool SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount, bool frameAlreadyReleased);
+  /* the D3D11 readback path (the ACTIVE path on Helios — D3D12 device creation
+   * is unsupported there). The caller owns FinishProcessingFrame and calls it
+   * AFTER this returns: the acquired buffer must stay unreleased until the
+   * staging Map has completed, or dwm re-renders into it before the GPU copy
+   * executes and the delivered content is newer than the dirty rects describe
+   * (the persistent-ghost mechanism, 2026-07-06) */
+  bool SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount);
+
+  /* D3D11 readback path: staging texture reused across frames (recreated on
+   * format/size change only — a per-frame CreateTexture2D is a full venus
+   * round-trip on Helios) */
+  ComPtr<ID3D11Texture2D> m_d11Staging;
+  D3D11_TEXTURE2D_DESC    m_d11StagingDesc = {};
+
+  /* D3D11 readback path per-stage QPC telemetry, aggregated every 300 frames
+   * (rects fetch / staging / copy submit / map sync / memcpy / lgmp publish +
+   * inter-frame gap) — the swapchain thread is fully serialized, so these six
+   * stages ARE the delivered frame rate */
+  struct
+  {
+    LONGLONG rects, staging, copy, map, memcpyKvmfr, lgmp, gap;
+    LONGLONG mapMax, gapMax;
+    LONGLONG lastFrameEnd, windowStart;
+    unsigned frames, stagingRecreates;
+  } m_d11Stats = {};
 
 public:
   CSwapChainProcessor(IDDCX_MONITOR monitor, CIndirectDeviceContext * devContext, IDDCX_SWAPCHAIN hSwapChain,
