@@ -782,12 +782,32 @@ bool CSwapChainProcessor::SwapChainNewFrameSystem(const IDDCX_SYSTEM_BUFFER_INFO
   return true;
 }
 
+void CSwapChainProcessor::AccumulatePendingDamage(const RECT * rects, unsigned count)
+{
+  if (m_pendingFullDamage)
+    return;
+
+  if (m_nbPendingDamage + count > ARRAYSIZE(m_pendingDamage))
+  {
+    m_pendingFullDamage = true;
+    m_nbPendingDamage   = 0;
+    return;
+  }
+
+  memcpy(m_pendingDamage + m_nbPendingDamage, rects, count * sizeof(*rects));
+  m_nbPendingDamage += count;
+}
+
 bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount)
 {
   /* the CALLER owns FinishProcessingFrame and issues it after this returns —
    * the acquired buffer must stay unreleased until the staging Map completes
    * (see the declaration comment); every early return below therefore just
-   * returns and lets the main loop finish the frame */
+   * returns and lets the main loop finish the frame. Every return AFTER the
+   * dirty rects were consumed from IddCx must first bank them as pending
+   * damage (see the member comment); a pre-rects failure banks FULL damage
+   * because the frame's rects are unknown but IddCx still counts them as
+   * handled once the caller finishes the frame. */
 
   LARGE_INTEGER qpcFreq;
   QueryPerformanceFrequency(&qpcFreq);
@@ -802,6 +822,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   if (!acquiredBuffer)
   {
     DEBUG_ERROR("D3D11 fallback acquired a null buffer");
+    m_pendingFullDamage = true;
     return false;
   }
 
@@ -811,6 +832,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   if (FAILED(hr))
   {
     DEBUG_ERROR_HR(hr, "Failed to obtain the ID3D11Texture2D from the acquiredBuffer");
+    m_pendingFullDamage = true;
     return false;
   }
 
@@ -824,6 +846,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   if (frameType == FRAME_TYPE_INVALID)
   {
     DEBUG_ERROR("Unsupported D3D11 fallback frame format 0x%x", desc.Format);
+    m_pendingFullDamage = true;
     return false;
   }
 
@@ -873,6 +896,27 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
       nbDirtyRects = dirtyOut.DirtyRectOutCount;
   }
   ClipDirtyRects(dirtyRects, &nbDirtyRects, frameFormat.desc);
+
+  /* fold in the damage owed from previously dropped frames — from here on,
+   * dirtyRects is the debt-inclusive delivery set: a failure below banks it
+   * back in full via AccumulatePendingDamage */
+  if (m_pendingFullDamage ||
+      m_nbPendingDamage + nbDirtyRects > ARRAYSIZE(dirtyRects))
+  {
+    dirtyRects[0].left   = 0;
+    dirtyRects[0].top    = 0;
+    dirtyRects[0].right  = static_cast<LONG>(desc.Width);
+    dirtyRects[0].bottom = static_cast<LONG>(desc.Height);
+    nbDirtyRects = 1;
+  }
+  else if (m_nbPendingDamage)
+  {
+    memcpy(dirtyRects + nbDirtyRects, m_pendingDamage,
+      m_nbPendingDamage * sizeof(*dirtyRects));
+    nbDirtyRects += m_nbPendingDamage;
+  }
+  m_pendingFullDamage = false;
+  m_nbPendingDamage   = 0;
   const LONGLONG tRects = nowUs();
 
   if (!m_d11Staging ||
@@ -892,6 +936,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
     if (FAILED(hr))
     {
       DEBUG_ERROR_HR(hr, "Failed to create D3D11 staging texture");
+      AccumulatePendingDamage(dirtyRects, nbDirtyRects);
       return false;
     }
     m_d11StagingDesc = stagingDesc;
@@ -914,6 +959,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   if (FAILED(hr))
   {
     DEBUG_ERROR_HR(hr, "Failed to map D3D11 staging texture");
+    AccumulatePendingDamage(dirtyRects, nbDirtyRects);
     return false;
   }
   const LONGLONG tMap = nowUs();
@@ -923,6 +969,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   {
     DEBUG_ERROR("Failed to prepare D3D11 fallback frame buffer");
     context->Unmap(staging, 0);
+    AccumulatePendingDamage(dirtyRects, nbDirtyRects);
     return false;
   }
 

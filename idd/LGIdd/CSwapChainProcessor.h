@@ -79,6 +79,22 @@ private:
    * read once per swapchain bring-up (InitDevices) — toggle takes effect on
    * IDD device restart / monitor replug. */
   bool     m_forceFullDamage = false;
+
+  /* damage owed to the client from frames that were acquired (their dirty
+   * rects consumed from IddCx) but then DROPPED before delivery (LGMP queue
+   * full, Map/staging failure). IddCx considers that damage handled, so
+   * unless it is re-delivered the client keeps the stale pixels forever —
+   * drops cluster at the highest-damage moments (observed live 2026-07-06:
+   * 'LGMP frame queue full' exactly at the login→desktop transition, giant
+   * permanent ghosts). Folded into the next delivered frame's damage set;
+   * overflow escalates to full-frame damage. */
+  RECT     m_pendingDamage[LG_MAX_DIRTY_RECTS] = {};
+  unsigned m_nbPendingDamage = 0;
+  bool     m_pendingFullDamage = false;
+
+  /* record the (already debt-merged) damage set of a dropped frame */
+  void AccumulatePendingDamage(const RECT * rects, unsigned count);
+
   LONG     m_copyBusyDrops = 0;
   LONG     m_systemFrameCount = 0;
   LONG     m_systemAcquireFailures = 0;

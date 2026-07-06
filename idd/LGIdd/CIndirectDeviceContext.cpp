@@ -1291,7 +1291,15 @@ void CIndirectDeviceContext::ProcessLGMP(bool allowReplug)
   if (lgmpHostQueueNewSubs(m_frameQueue) && m_monitor)
   {
     if (m_hasFrame)
+    {
+      /* a new subscriber has no baseline: the re-posted frame must carry
+       * FULL damage (damageRectsCount = 0 is the KVMFR full-frame sentinel)
+       * or the client only ever patches the last frame's rects over garbage
+       * and shows stale content everywhere else until something re-damages
+       * it (2026-07-06 cold-boot extreme-ghosting class) */
+      m_frame[m_frameIndex]->damageRectsCount = 0;
       lgmpHostQueuePost(m_frameQueue, 0, m_frameMemory[m_frameIndex]);
+    }
   }
 
   if (lgmpHostQueueNewSubs(m_pointerQueue))
