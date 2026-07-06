@@ -21,6 +21,7 @@
 #include "CSwapChainProcessor.h"
 
 #include <avrt.h>
+#include <smmintrin.h>
 #include "CDebug.h"
 #include "CPipeServer.h"
 #include "CPlatformInfo.h"
@@ -638,6 +639,43 @@ void CSwapChainProcessor::CompletionFunction(
 }
 
 
+/* Copy from a WRITE-COMBINED source mapping. Plain loads from WC memory are
+ * uncacheable (~160-600 MB/s measured on the venus staging mapping, 2026-07-06
+ * BW probe); MOVNTDQA streaming loads use the WC read buffers and recover
+ * multiple GB/s. Falls back to memcpy for the unaligned head/tail. The source
+ * must not be concurrently written (we hold the acquired frame). */
+static void CopyFromWC(void * dst, const void * src, size_t bytes)
+{
+  uint8_t * d = static_cast<uint8_t *>(dst);
+  const uint8_t * s = static_cast<const uint8_t *>(src);
+
+  const size_t headBytes = (16 - (reinterpret_cast<uintptr_t>(s) & 15)) & 15;
+  if (headBytes)
+  {
+    const size_t n = headBytes < bytes ? headBytes : bytes;
+    memcpy(d, s, n);
+    d += n; s += n; bytes -= n;
+  }
+
+  while (bytes >= 64)
+  {
+    const __m128i * sv = reinterpret_cast<const __m128i *>(s);
+    const __m128i v0 = _mm_stream_load_si128(const_cast<__m128i *>(sv + 0));
+    const __m128i v1 = _mm_stream_load_si128(const_cast<__m128i *>(sv + 1));
+    const __m128i v2 = _mm_stream_load_si128(const_cast<__m128i *>(sv + 2));
+    const __m128i v3 = _mm_stream_load_si128(const_cast<__m128i *>(sv + 3));
+    __m128i * dv = reinterpret_cast<__m128i *>(d);
+    _mm_storeu_si128(dv + 0, v0);
+    _mm_storeu_si128(dv + 1, v1);
+    _mm_storeu_si128(dv + 2, v2);
+    _mm_storeu_si128(dv + 3, v3);
+    s += 64; d += 64; bytes -= 64;
+  }
+
+  if (bytes)
+    memcpy(d, s, bytes);
+}
+
 static bool IsFullDamage(const RECT * dirtyRects, unsigned nbDirtyRects,
   const D3D12_RESOURCE_DESC& desc)
 {
@@ -1034,6 +1072,34 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   const size_t rowBytes = srcRowBytes < mapped.RowPitch ? srcRowBytes : mapped.RowPitch;
   size_t rows = desc.Height < buffer.height ? desc.Height : buffer.height;
 
+  /* one-shot bandwidth probe: is the ~35ms frame memcpy bound by READS of the
+   * venus-mapped staging (cache attribute = the host's per-blob map_info) or
+   * WRITES to the write-combined IVSHMEM mapping? 4 MiB each way. */
+  if (!m_bwProbed && rows * rowBytes >= (4u << 20))
+  {
+    m_bwProbed = true;
+    const size_t probeBytes = 4u << 20;
+    const uint8_t * src = static_cast<const uint8_t *>(mapped.pData);
+    volatile uint64_t sink = 0;
+    const LONGLONG r0 = nowUs();
+    for (size_t i = 0; i < probeBytes; i += 64)
+      sink += src[i];
+    const LONGLONG r1 = nowUs();
+    memset(buffer.mem, 0, probeBytes);
+    const LONGLONG w1 = nowUs();
+    memcpy(buffer.mem, src, probeBytes);
+    const LONGLONG c1 = nowUs();
+    CopyFromWC(buffer.mem, src, probeBytes);
+    const LONGLONG s1 = nowUs();
+    DEBUG_INFO("BW probe (4MiB): src strided-read %.0f MB/s | dst memset %.0f MB/s | "
+               "memcpy %.0f MB/s | streamcpy %.0f MB/s (sink=%llu)",
+      4.0 * 1e6 / (double)(r1 - r0),
+      4.0 * 1e6 / (double)(w1 - r1),
+      4.0 * 1e6 / (double)(c1 - w1),
+      4.0 * 1e6 / (double)(s1 - c1),
+      (unsigned long long)sink);
+  }
+
   const uint8_t * src = static_cast<const uint8_t *>(mapped.pData);
   uint8_t * dst = buffer.mem;
   uint64_t sampleHash = 1469598103934665603ull;
@@ -1053,7 +1119,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   for (size_t row = 0; row < rows; ++row)
   {
     const size_t copyBytes = rowBytes < buffer.pitch ? rowBytes : buffer.pitch;
-    memcpy(dst + row * buffer.pitch, src + row * mapped.RowPitch, copyBytes);
+    CopyFromWC(dst + row * buffer.pitch, src + row * mapped.RowPitch, copyBytes);
     if (row == 0 || row == rows / 2 || row + 1 == rows)
     {
       const uint8_t * sample = src + row * mapped.RowPitch;

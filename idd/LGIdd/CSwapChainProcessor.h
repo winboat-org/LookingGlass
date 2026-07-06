@@ -91,6 +91,8 @@ private:
   RECT     m_pendingDamage[LG_MAX_DIRTY_RECTS] = {};
   unsigned m_nbPendingDamage = 0;
   bool     m_pendingFullDamage = false;
+  /* one-shot src-read vs dst-write bandwidth probe (see SwapChainNewFrameD3D11) */
+  bool     m_bwProbed = false;
 
   /* record the (already debt-merged) damage set of a dropped frame */
   void AccumulatePendingDamage(const RECT * rects, unsigned count);
