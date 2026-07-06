@@ -583,6 +583,7 @@ int main_frameThread(void * unused)
   uint32_t          frameSerial = 0;
   uint32_t          formatVer   = 0;
   size_t            dataSize    = 0;
+  unsigned          formatFails = 0;
   LG_RendererFormat lgrFormat;
 
   struct DMAFrameInfo dmaInfo[LGMP_Q_FRAME_LEN] = {0};
@@ -649,12 +650,22 @@ int main_frameThread(void * unused)
     }
 
     KVMFRFrame * frame = (KVMFRFrame *)msg.mem;
-    if (frame->type == FRAME_TYPE_INVALID || frame->type >= FRAME_TYPE_MAX)
+    /* a zero geometry field describes a zero-byte buffer: it would propagate
+     * into a 0-size PBO and glMapBufferRange(…, 0, …) GL_INVALID_VALUE inside
+     * onFrameFormat (seen live 2026-07-06 when the host side died mid-write).
+     * Malformed frames are skipped, never fatal — the launcher tears down the
+     * whole VM when this client exits. */
+    if (frame->type == FRAME_TYPE_INVALID || frame->type >= FRAME_TYPE_MAX ||
+        !frame->frameWidth || !frame->frameHeight ||
+        !frame->dataWidth  || !frame->dataHeight  ||
+        !frame->stride     || !frame->pitch)
     {
       DEBUG_WARN("Ignoring invalid desktop frame: type=%u rotation=%u "
-          "formatVer=%u serial=%u data=%ux%u pitch=%u offset=%u",
+          "formatVer=%u serial=%u frame=%ux%u data=%ux%u stride=%u pitch=%u offset=%u",
           frame->type, frame->rotation, frame->formatVer, frame->frameSerial,
-          frame->dataWidth, frame->dataHeight, frame->pitch, frame->offset);
+          frame->frameWidth, frame->frameHeight,
+          frame->dataWidth, frame->dataHeight,
+          frame->stride, frame->pitch, frame->offset);
       lgmpClientMessageDone(queue);
       continue;
     }
@@ -765,12 +776,27 @@ int main_frameThread(void * unused)
       LG_LOCK(g_state.lgrLock);
       if (!RENDERER(onFrameFormat, lgrFormat))
       {
-        DEBUG_ERROR("renderer failed to configure format");
-        g_state.state = APP_STATE_SHUTDOWN;
         LG_UNLOCK(g_state.lgrLock);
+        /* a bad format must not take the client down (the launcher tears
+         * down the whole VM when this client exits) — drop the frame and
+         * retry on the next one; only a persistently failing renderer is
+         * fatal. formatValid stays false so the next frame re-enters this
+         * configure block. */
+        g_state.formatValid = false;
+        if (++formatFails < 10)
+        {
+          DEBUG_ERROR("renderer failed to configure format; "
+              "skipping frame and waiting for the next one (%u/10)", formatFails);
+          lgmpClientMessageDone(queue);
+          continue;
+        }
+        DEBUG_ERROR("renderer failed to configure format %u consecutive times; giving up",
+            formatFails);
+        g_state.state = APP_STATE_SHUTDOWN;
         break;
       }
       LG_UNLOCK(g_state.lgrLock);
+      formatFails = 0;
 
       g_state.srcSize.x = lgrFormat.screenWidth;
       g_state.srcSize.y = lgrFormat.screenHeight;
