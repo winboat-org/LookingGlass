@@ -138,7 +138,8 @@ private:
    * staging Map has completed, or dwm re-renders into it before the GPU copy
    * executes and the delivered content is newer than the dirty rects describe
    * (the persistent-ghost mechanism, 2026-07-06) */
-  bool SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount);
+  bool SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer,
+    unsigned dirtyRectCount, unsigned moveRegionCount);
 
   /* D3D11 readback path: staging texture reused across frames (recreated on
    * format/size change only — a per-frame CreateTexture2D is a full venus

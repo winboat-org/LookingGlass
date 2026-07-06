@@ -401,6 +401,7 @@ bool CSwapChainProcessor::SwapChainThreadCore()
 
     UINT frameNumber = 0;
     UINT dirtyRectCount = 0;
+    UINT moveRegionCount = 0;
     ComPtr<IDXGIResource> surface;
     IDDCX_SYSTEM_BUFFER_INFO sysBuffer = {};
     bool useSystemBuffer = false;
@@ -428,6 +429,7 @@ bool CSwapChainProcessor::SwapChainThreadCore()
         {
           frameNumber = meta.PresentationFrameNumber;
           dirtyRectCount = meta.DirtyRectCount;
+          moveRegionCount = meta.MoveRegionCount;
           useSystemBuffer = true;
         }
       }
@@ -437,13 +439,15 @@ bool CSwapChainProcessor::SwapChainThreadCore()
 
         hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &buffer);
         if (hr != E_PENDING)
-          DEBUG_INFO("IddCx acquire returned hr=0x%08x frame=%u dirty=%u surface=%p",
+          DEBUG_INFO("IddCx acquire returned hr=0x%08x frame=%u dirty=%u moves=%u surface=%p",
             hr, buffer.MetaData.PresentationFrameNumber,
-            buffer.MetaData.DirtyRectCount, buffer.MetaData.pSurface);
+            buffer.MetaData.DirtyRectCount, buffer.MetaData.MoveRegionCount,
+            buffer.MetaData.pSurface);
         if (SUCCEEDED(hr))
         {
           frameNumber = buffer.MetaData.PresentationFrameNumber;
           dirtyRectCount = buffer.MetaData.DirtyRectCount;
+          moveRegionCount = buffer.MetaData.MoveRegionCount;
           surface.Attach(buffer.MetaData.pSurface);
         }
       }
@@ -466,6 +470,8 @@ bool CSwapChainProcessor::SwapChainThreadCore()
       {
         frameNumber = buffer.MetaData.PresentationFrameNumber;
         dirtyRectCount = buffer.MetaData.DirtyRectCount;
+        /* IDDCX_METADATA2 carries no MoveRegionCount — acquire2 frames
+         * deliver all updates via dirty rects */
         surface.Attach(buffer.MetaData.pSurface);
       }
     }
@@ -476,13 +482,15 @@ bool CSwapChainProcessor::SwapChainThreadCore()
 
       hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &buffer);
       if (hr != E_PENDING)
-        DEBUG_INFO("IddCx acquire legacy returned hr=0x%08x frame=%u dirty=%u surface=%p",
+        DEBUG_INFO("IddCx acquire legacy returned hr=0x%08x frame=%u dirty=%u moves=%u surface=%p",
           hr, buffer.MetaData.PresentationFrameNumber,
-          buffer.MetaData.DirtyRectCount, buffer.MetaData.pSurface);
+          buffer.MetaData.DirtyRectCount, buffer.MetaData.MoveRegionCount,
+          buffer.MetaData.pSurface);
       if (SUCCEEDED(hr))
       {
         frameNumber = buffer.MetaData.PresentationFrameNumber;
         dirtyRectCount = buffer.MetaData.DirtyRectCount;
+        moveRegionCount = buffer.MetaData.MoveRegionCount;
         surface.Attach(buffer.MetaData.pSurface);
       }
     }
@@ -539,18 +547,25 @@ bool CSwapChainProcessor::SwapChainThreadCore()
          * so both the staging copy and the KVMFR damage rects cover the whole
          * frame (see the member comment in CSwapChainProcessor.h) */
         if (m_forceFullDamage)
+        {
           dirtyRectCount = LG_MAX_DIRTY_RECTS + 1;
+          moveRegionCount = 0;
+        }
         if (useSystemBuffer)
-          SwapChainNewFrameSystem(sysBuffer, dirtyRectCount);
+          /* move regions unhandled on this path: degrade to full damage */
+          SwapChainNewFrameSystem(sysBuffer,
+            moveRegionCount ? LG_MAX_DIRTY_RECTS + 1 : dirtyRectCount);
         else if (!m_dx12Device)
         {
-          DEBUG_TRACE("D3D11 fallback acquired frame=%u dirty=%u surface=%p",
-            frameNumber, dirtyRectCount, surface.Get());
-          SwapChainNewFrameD3D11(surface, dirtyRectCount);
+          DEBUG_TRACE("D3D11 fallback acquired frame=%u dirty=%u moves=%u surface=%p",
+            frameNumber, dirtyRectCount, moveRegionCount, surface.Get());
+          SwapChainNewFrameD3D11(surface, dirtyRectCount, moveRegionCount);
           surface.Reset();
         }
         else
-          SwapChainNewFrame(surface, dirtyRectCount);
+          /* move regions unhandled on this path: degrade to full damage */
+          SwapChainNewFrame(surface,
+            moveRegionCount ? LG_MAX_DIRTY_RECTS + 1 : dirtyRectCount);
       }
 
       // report that all GPU processing for this frame has been queued
@@ -798,7 +813,8 @@ void CSwapChainProcessor::AccumulatePendingDamage(const RECT * rects, unsigned c
   m_nbPendingDamage += count;
 }
 
-bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer, unsigned dirtyRectCount)
+bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredBuffer,
+  unsigned dirtyRectCount, unsigned moveRegionCount)
 {
   /* the CALLER owns FinishProcessingFrame and issues it after this returns —
    * the acquired buffer must stay unreleased until the staging Map completes
@@ -866,19 +882,20 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   frameFormat.hdrPQ = false;
 
   RECT dirtyRects[LG_MAX_DIRTY_RECTS] = {};
-  unsigned nbDirtyRects = dirtyRectCount;
-  if (nbDirtyRects == 0 || nbDirtyRects > ARRAYSIZE(dirtyRects) || m_nbDirtyRects == 0)
-  {
-    dirtyRects[0].left = 0;
-    dirtyRects[0].top = 0;
-    dirtyRects[0].right = static_cast<LONG>(desc.Width);
-    dirtyRects[0].bottom = static_cast<LONG>(desc.Height);
-    nbDirtyRects = 1;
-  }
-  else
+  unsigned nbDirtyRects = 0;
+  /* full damage when: nothing was reported at all (unknowable), either
+   * count overflows our capacity, or no frame has been delivered yet
+   * (the client has no baseline for this stream) */
+  bool fullDamage =
+    (dirtyRectCount == 0 && moveRegionCount == 0) ||
+    dirtyRectCount  > ARRAYSIZE(dirtyRects)       ||
+    moveRegionCount > ARRAYSIZE(dirtyRects)       ||
+    m_nbDirtyRects == 0;
+
+  if (!fullDamage && dirtyRectCount > 0)
   {
     IDARG_IN_GETDIRTYRECTS dirtyIn = {};
-    dirtyIn.DirtyRectInCount = nbDirtyRects;
+    dirtyIn.DirtyRectInCount = dirtyRectCount;
     dirtyIn.pDirtyRects = dirtyRects;
 
     IDARG_OUT_GETDIRTYRECTS dirtyOut = {};
@@ -886,14 +903,53 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
     if (FAILED(hr))
     {
       DEBUG_ERROR_HR(hr, "IddCxSwapChainGetDirtyRects Failed");
-      dirtyRects[0].left = 0;
-      dirtyRects[0].top = 0;
-      dirtyRects[0].right = static_cast<LONG>(desc.Width);
-      dirtyRects[0].bottom = static_cast<LONG>(desc.Height);
-      nbDirtyRects = 1;
+      fullDamage = true;
     }
     else
       nbDirtyRects = dirtyOut.DirtyRectOutCount;
+  }
+
+  /* a window drag is delivered as MOVE REGIONS (the moved content) plus
+   * dirty rects covering only the exposed edges — dropping the moves loses
+   * the dragged window's damage and ghosts the drag (owner-reproducible,
+   * 2026-07-06). The staging copy below is always full-frame, so the
+   * DESTINATION rect is all the client needs; the vacated source area
+   * arrives as regular dirty rects. */
+  if (!fullDamage && moveRegionCount > 0)
+  {
+    IDDCX_MOVEREGION moves[LG_MAX_DIRTY_RECTS] = {};
+    IDARG_IN_GETMOVEREGIONS moveIn = {};
+    moveIn.MoveRegionInCount = moveRegionCount;
+    moveIn.pMoveRegions = moves;
+
+    IDARG_OUT_GETMOVEREGIONS moveOut = {};
+    hr = IddCxSwapChainGetMoveRegions(m_hSwapChain, &moveIn, &moveOut);
+    if (FAILED(hr))
+    {
+      DEBUG_ERROR_HR(hr, "IddCxSwapChainGetMoveRegions Failed");
+      fullDamage = true;
+    }
+    else
+    {
+      for (unsigned i = 0; i < moveOut.MoveRegionOutCount; ++i)
+      {
+        if (nbDirtyRects >= ARRAYSIZE(dirtyRects))
+        {
+          fullDamage = true;
+          break;
+        }
+        dirtyRects[nbDirtyRects++] = moves[i].DestRect;
+      }
+    }
+  }
+
+  if (fullDamage)
+  {
+    dirtyRects[0].left = 0;
+    dirtyRects[0].top = 0;
+    dirtyRects[0].right = static_cast<LONG>(desc.Width);
+    dirtyRects[0].bottom = static_cast<LONG>(desc.Height);
+    nbDirtyRects = 1;
   }
   ClipDirtyRects(dirtyRects, &nbDirtyRects, frameFormat.desc);
 
