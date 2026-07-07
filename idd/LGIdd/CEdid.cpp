@@ -485,7 +485,7 @@ static CtaHdmiForumVendorSpecificDataBlock MakeCtaHdmiForumVendorSpecificDataBlo
   return block;
 }
 
-static CtaHdmiVendorSpecificDataBlock MakeCtaHdmiVendorSpecificDataBlock()
+static CtaHdmiVendorSpecificDataBlock MakeCtaHdmiVendorSpecificDataBlock(bool advertiseHdr)
 {
   CtaHdmiVendorSpecificDataBlock block = {};
 
@@ -494,7 +494,7 @@ static CtaHdmiVendorSpecificDataBlock MakeCtaHdmiVendorSpecificDataBlock()
   memcpy(block.ieeeOui, CTA_HDMI_LICENSING_OUI, sizeof(block.ieeeOui));
   block.physicalAddressAB = CTA_HDMI_PHYSICAL_ADDRESS_A_B;
   block.physicalAddressCD = CTA_HDMI_PHYSICAL_ADDRESS_C_D;
-  block.flags             = CTA_HDMI_DEEP_COLOR_30_36;
+  block.flags             = advertiseHdr ? CTA_HDMI_DEEP_COLOR_30_36 : 0;
   block.maxTmdsClock      = CTA_HDMI_MAX_TMDS_CLOCK_UNSPECIFIED;
   block.latencyFields     = CTA_HDMI_LATENCY_FIELDS_NONE;
   return block;
@@ -527,7 +527,7 @@ bool CEdid::WriteDetailedTiming(BYTE* dtd, const CSettings::DisplayMode& mode)
   return true;
 }
 
-void CEdid::Build(const CSettings::DisplayModes& modes)
+void CEdid::Build(const CSettings::DisplayModes& modes, bool advertiseHdr)
 {
   m_data.assign(static_cast<std::vector<BYTE, std::allocator<BYTE>>::size_type>(EDID_BLOCK_SIZE) * 2, 0);
 
@@ -576,10 +576,13 @@ void CEdid::Build(const CSettings::DisplayModes& modes)
   ctaBlock.revision = CTA_REVISION;
 
   UINT dataOffset = CTA_HEADER_SIZE;
-  AppendCtaDataBlock(cta, dataOffset, MakeCtaHdrStaticMetadataDataBlock      ());
-  AppendCtaDataBlock(cta, dataOffset, MakeCtaColorimetryDataBlock            ());
+  if (advertiseHdr)
+  {
+    AppendCtaDataBlock(cta, dataOffset, MakeCtaHdrStaticMetadataDataBlock());
+    AppendCtaDataBlock(cta, dataOffset, MakeCtaColorimetryDataBlock());
+  }
   AppendCtaDataBlock(cta, dataOffset, MakeCtaHdmiForumVendorSpecificDataBlock());
-  AppendCtaDataBlock(cta, dataOffset, MakeCtaHdmiVendorSpecificDataBlock     ());
+  AppendCtaDataBlock(cta, dataOffset, MakeCtaHdmiVendorSpecificDataBlock(advertiseHdr));
 
   ctaBlock.dtdOffset = (BYTE)dataOffset;
   ctaBlock.flags     = 0x00;

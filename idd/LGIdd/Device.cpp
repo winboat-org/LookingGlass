@@ -235,8 +235,11 @@ NTSTATUS LGIddCreateDevice(_Inout_ PWDFDEVICE_INIT deviceInit)
     return status;
   }
   const bool hasIddCx110DDIs = LGIddCanUseIddCx110DDIs(ver.IddCxVersion);
+  const bool enableHdrWcg = hasIddCx110DDIs && g_settings.ReadBoolValue(L"EnableHdrWcg", false);
   DEBUG_INFO("Version: 0x%04x", ver.IddCxVersion);
-  DEBUG_INFO("IddCx 1.10 HDR/WCG DDIs: %s", hasIddCx110DDIs ? "available" : "unavailable");
+  DEBUG_INFO("IddCx 1.10 HDR/WCG DDIs: %s (enabled: %s)",
+    hasIddCx110DDIs ? "available" : "unavailable",
+    enableHdrWcg ? "yes" : "no");
 
   WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks;
   WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPowerCallbacks);
@@ -252,7 +255,7 @@ NTSTATUS LGIddCreateDevice(_Inout_ PWDFDEVICE_INIT deviceInit)
 
 #if defined(IDDCX_VERSION_MAJOR) && defined(IDDCX_VERSION_MINOR) && \
   (IDDCX_VERSION_MAJOR > 1 || (IDDCX_VERSION_MAJOR == 1 && IDDCX_VERSION_MINOR >= 10))
-  if (hasIddCx110DDIs)
+  if (enableHdrWcg)
   {
     config.EvtIddCxParseMonitorDescription2      = LGIddParseMonitorDescription2;
     config.EvtIddCxMonitorQueryTargetModes2      = LGIddMonitorQueryTargetModes2;

@@ -132,9 +132,9 @@ void CIndirectDeviceContext::QueryIddCxCapabilities()
   const bool hasIddCx110DDIs = false;
 #endif
 
-  // Helios currently uses the D3D11 readback path. Keep the IDD on the legacy
-  // acquire APIs until the Helios path can prove stable FP16/HDR handling.
-  m_canProcessFP16 = false;
+  // Helios currently uses the D3D11 readback path. Keep HDR/WCG opt-in until
+  // the Helios path proves stable FP16 handling end to end.
+  m_canProcessFP16 = g_settings.ReadBoolValue(L"EnableHdrWcg", false);
 
   DEBUG_INFO("IddCx version: 0x%04x", m_iddCxVersion);
   DEBUG_INFO("IddCx 1.10 HDR/WCG DDIs: %s (runtime support: %s)",
@@ -151,7 +151,7 @@ void CIndirectDeviceContext::PopulateDefaultModes()
   for (auto& dm : g_settings.GetDisplayModes())
     m_displayModes.push_back(dm);
 
-  m_edid.Build(m_displayModes);
+  m_edid.Build(m_displayModes, CanUseIddCx110DDIs());
 }
 
 void CIndirectDeviceContext::InitAdapter()
