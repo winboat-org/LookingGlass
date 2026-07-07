@@ -919,6 +919,12 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   frameFormat.hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
   frameFormat.hdrPQ = false;
 
+  const bool stagingFormatChanged =
+    !m_d11Staging ||
+    m_d11StagingDesc.Width  != desc.Width  ||
+    m_d11StagingDesc.Height != desc.Height ||
+    m_d11StagingDesc.Format != desc.Format;
+
   RECT dirtyRects[LG_MAX_DIRTY_RECTS] = {};
   unsigned nbDirtyRects = 0;
   /* full damage when: nothing was reported at all (unknowable), either
@@ -928,6 +934,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
     (dirtyRectCount == 0 && moveRegionCount == 0) ||
     dirtyRectCount  > ARRAYSIZE(dirtyRects)       ||
     moveRegionCount > ARRAYSIZE(dirtyRects)       ||
+    stagingFormatChanged                          ||
     m_nbDirtyRects == 0;
 
   if (!fullDamage && dirtyRectCount > 0)
@@ -1013,10 +1020,7 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   m_nbPendingDamage   = 0;
   const LONGLONG tRects = nowUs();
 
-  if (!m_d11Staging ||
-      m_d11StagingDesc.Width  != desc.Width  ||
-      m_d11StagingDesc.Height != desc.Height ||
-      m_d11StagingDesc.Format != desc.Format)
+  if (stagingFormatChanged)
   {
     D3D11_TEXTURE2D_DESC stagingDesc = desc;
     stagingDesc.BindFlags = 0;
@@ -1039,9 +1043,42 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
   ID3D11Texture2D * staging = m_d11Staging.Get();
   const LONGLONG tStaging = nowUs();
 
+  const bool copyFullFrame =
+    IsFullDamage(dirtyRects, nbDirtyRects, frameFormat.desc) ||
+    m_nbDirtyRects + nbDirtyRects > ARRAYSIZE(dirtyRects);
+
   auto context = m_dx11Device->GetBaseContext();
-  DEBUG_TRACE("D3D11 fallback: CopyResource staging<-swapchain");
-  context->CopyResource(staging, texture.Get());
+  if (copyFullFrame)
+  {
+    DEBUG_TRACE("D3D11 fallback: CopyResource staging<-swapchain");
+    context->CopyResource(staging, texture.Get());
+  }
+  else
+  {
+    DEBUG_TRACE("D3D11 fallback: CopySubresourceRegion staging<-swapchain");
+    auto copyRectToStaging = [&](RECT rect)
+    {
+      if (!ClipDirtyRect(rect, frameFormat.desc))
+        return;
+
+      D3D11_BOX box = {};
+      box.left   = (UINT)rect.left;
+      box.top    = (UINT)rect.top;
+      box.front  = 0;
+      box.right  = (UINT)rect.right;
+      box.bottom = (UINT)rect.bottom;
+      box.back   = 1;
+
+      context->CopySubresourceRegion(staging, 0,
+        (UINT)rect.left, (UINT)rect.top, 0, texture.Get(), 0, &box);
+    };
+
+    for (const RECT * rect = m_dirtyRects; rect < m_dirtyRects + m_nbDirtyRects; ++rect)
+      copyRectToStaging(*rect);
+
+    for (const RECT * rect = dirtyRects; rect < dirtyRects + nbDirtyRects; ++rect)
+      copyRectToStaging(*rect);
+  }
 
   acquiredBuffer.Reset();
   texture.Reset();
@@ -1102,6 +1139,9 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
 
   const uint8_t * src = static_cast<const uint8_t *>(mapped.pData);
   uint8_t * dst = buffer.mem;
+  size_t copiedRows = 0;
+  size_t copiedBytes = 0;
+  unsigned copiedRects = 0;
   uint64_t sampleHash = 1469598103934665603ull;
   uint32_t sampleNonZero = 0;
   uint32_t sampleBytes = 0;
@@ -1116,24 +1156,69 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
       src + centerRow * mapped.RowPitch + centerCol * bpp,
       sizeof(centerPixel));
   }
-  for (size_t row = 0; row < rows; ++row)
+  auto copyMappedRect = [&](RECT rect)
   {
-    const size_t copyBytes = rowBytes < buffer.pitch ? rowBytes : buffer.pitch;
-    CopyFromWC(dst + row * buffer.pitch, src + row * mapped.RowPitch, copyBytes);
-    if (row == 0 || row == rows / 2 || row + 1 == rows)
+    if (!ClipDirtyRect(rect, frameFormat.desc))
+      return;
+
+    if (rect.top >= (LONG)rows)
+      return;
+    if (rect.bottom > (LONG)rows)
+      rect.bottom = (LONG)rows;
+
+    const size_t leftBytes = (size_t)rect.left * bpp;
+    if (leftBytes >= rowBytes || leftBytes >= buffer.pitch)
+      return;
+
+    const size_t rectBytes = (size_t)(rect.right - rect.left) * bpp;
+    const size_t srcAvail = rowBytes - leftBytes;
+    const size_t dstAvail = buffer.pitch - leftBytes;
+    const size_t copyBytes = min(rectBytes, min(srcAvail, dstAvail));
+    if (copyBytes == 0)
+      return;
+
+    for (LONG row = rect.top; row < rect.bottom; ++row)
     {
-      const uint8_t * sample = src + row * mapped.RowPitch;
-      for (size_t i = 0; i < copyBytes; i += 64)
-      {
-        const uint8_t v = sample[i];
-        sampleNonZero += v != 0;
-        sampleHash ^= v;
-        sampleHash *= 1099511628211ull;
-        ++sampleBytes;
-      }
+      CopyFromWC(dst + (size_t)row * buffer.pitch + leftBytes,
+        src + (size_t)row * mapped.RowPitch + leftBytes, copyBytes);
+      ++copiedRows;
+      copiedBytes += copyBytes;
     }
-    if (buffer.pitch > copyBytes)
-      memset(dst + row * buffer.pitch + copyBytes, 0, buffer.pitch - copyBytes);
+    ++copiedRects;
+  };
+
+  if (copyFullFrame)
+  {
+    for (size_t row = 0; row < rows; ++row)
+    {
+      const size_t copyBytes = rowBytes < buffer.pitch ? rowBytes : buffer.pitch;
+      CopyFromWC(dst + row * buffer.pitch, src + row * mapped.RowPitch, copyBytes);
+      if (row == 0 || row == rows / 2 || row + 1 == rows)
+      {
+        const uint8_t * sample = src + row * mapped.RowPitch;
+        for (size_t i = 0; i < copyBytes; i += 64)
+        {
+          const uint8_t v = sample[i];
+          sampleNonZero += v != 0;
+          sampleHash ^= v;
+          sampleHash *= 1099511628211ull;
+          ++sampleBytes;
+        }
+      }
+      if (buffer.pitch > copyBytes)
+        memset(dst + row * buffer.pitch + copyBytes, 0, buffer.pitch - copyBytes);
+      ++copiedRows;
+      copiedBytes += copyBytes;
+    }
+    copiedRects = 1;
+  }
+  else
+  {
+    for (const RECT * rect = m_dirtyRects; rect < m_dirtyRects + m_nbDirtyRects; ++rect)
+      copyMappedRect(*rect);
+
+    for (const RECT * rect = dirtyRects; rect < dirtyRects + nbDirtyRects; ++rect)
+      copyMappedRect(*rect);
   }
   context->Unmap(staging, 0);
   const LONGLONG tMemcpy = nowUs();
@@ -1178,9 +1263,11 @@ bool CSwapChainProcessor::SwapChainNewFrameD3D11(ComPtr<IDXGIResource> acquiredB
 
   const LONG frames = InterlockedIncrement(&m_systemFrameCount);
   if (frames == 1 || (frames % 30) == 0)
-    DEBUG_INFO("D3D11 fallback frame %ld: %ux%u srcPitch=%u dstPitch=%u format=0x%x dirty=%u rows=%llu rowBytes=%llu first=0x%08x center=0x%08x sampleNonZero=%u/%u sampleHash=0x%llx",
+    DEBUG_INFO("D3D11 fallback frame %ld: %ux%u srcPitch=%u dstPitch=%u format=0x%x dirty=%u copy=%s rects=%u copiedRows=%llu copiedBytes=%llu rows=%llu rowBytes=%llu first=0x%08x center=0x%08x sampleNonZero=%u/%u sampleHash=0x%llx",
       frames, desc.Width, desc.Height, mapped.RowPitch, buffer.pitch,
-      desc.Format, nbDirtyRects, (unsigned long long)rows, (unsigned long long)rowBytes,
+      desc.Format, nbDirtyRects, copyFullFrame ? "full" : "dirty", copiedRects,
+      (unsigned long long)copiedRows, (unsigned long long)copiedBytes,
+      (unsigned long long)rows, (unsigned long long)rowBytes,
       firstPixel, centerPixel, sampleNonZero, sampleBytes,
       (unsigned long long)sampleHash);
 
