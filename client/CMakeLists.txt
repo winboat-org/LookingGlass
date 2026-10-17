@@ -26,6 +26,13 @@ include(OptimizeForNative) # option(OPTIMIZE_FOR_NATIVE)
 include(UninstallTarget)
 
 find_package(PkgConfig)
+option(ENABLE_EPOXY "Dispatch graphics through libepoxy (portable static builds)" OFF)
+if(ENABLE_EPOXY)
+  pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy x11-xcb)
+  add_compile_definitions(ENABLE_EPOXY)
+  add_compile_options(-include "${PROJECT_SOURCE_DIR}/include/epoxy_compat.h")
+  link_libraries(PkgConfig::EPOXY)
+endif()
 pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3>=3.10)
 
@@ -293,3 +300,10 @@ install(FILES "${PROJECT_TOP}/resources/lg-logo.svg"
         RENAME "looking-glass.svg")
 
 feature_summary(WHAT ENABLED_FEATURES DISABLED_FEATURES)
+
+if(ENABLE_EPOXY AND SOLO_LIBRARY)
+  target_sources(looking-glass-client PRIVATE src/solo-providers.c src/portable-runtime.c)
+  add_library(solo STATIC IMPORTED)
+  set_target_properties(solo PROPERTIES IMPORTED_LOCATION "${SOLO_LIBRARY}")
+  set_property(TARGET PkgConfig::EPOXY APPEND PROPERTY INTERFACE_LINK_LIBRARIES solo stdc++)
+endif()

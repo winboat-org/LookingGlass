@@ -19,3 +19,7 @@ idd/*/Debug
 idd/*/VersionInfo.h
 idd/*/VERSION
 idd/packages
+
+/out/
+/result
+/client/src/solo-providers.c

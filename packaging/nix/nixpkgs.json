@@ -1,0 +1,7 @@
+{
+  "narHash": "sha256-vNkJbtmqyBfFhn/HnzQo4ROuoyYWuy/allqTfJb4kMY=",
+  "owner": "cachix",
+  "repo": "devenv-nixpkgs",
+  "rev": "c2f38fe7f9e04d9aadd354d380f2bd40531d9737",
+  "type": "github"
+}

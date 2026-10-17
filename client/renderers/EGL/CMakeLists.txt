@@ -2,10 +2,11 @@ cmake_minimum_required(VERSION 3.10)
 project(renderer_EGL LANGUAGES C CXX)
 
 find_package(PkgConfig)
-pkg_check_modules(RENDERER_EGL REQUIRED IMPORTED_TARGET
-  egl
-  gl
-)
+if(ENABLE_EPOXY)
+  pkg_check_modules(RENDERER_EGL REQUIRED IMPORTED_TARGET epoxy)
+else()
+  pkg_check_modules(RENDERER_EGL REQUIRED IMPORTED_TARGET egl gl)
+endif()
 
 pkg_check_modules(RENDERER_EGL_OPT IMPORTED_TARGET
   wayland-egl

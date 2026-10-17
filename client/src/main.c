@@ -4310,8 +4310,6 @@ int main(int argc, char * argv[])
   lgPathsInit("looking-glass");
   config_init();
   lgTransport_setup();
-  egl_dynProcsInit();
-  gl_dynProcsInit();
 
   if (!lgMessage_init())
     return -1;
@@ -4342,7 +4340,17 @@ int main(int argc, char * argv[])
   evdev_earlyInit();
 
   if (!config_load(argc, argv))
+  {
+    // A help-only invocation is also the portable package's startup check.
+    if (argc == 2 && (strcmp(argv[1], "--help") == 0 ||
+                     strcmp(argv[1], "-h") == 0))
+      return 0;
     return -1;
+  }
+
+  // Option handling, including --help, does not require host graphics drivers.
+  egl_dynProcsInit();
+  gl_dynProcsInit();
 
   const int ret = lg_run();
   lg_shutdown();

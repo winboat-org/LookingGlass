@@ -44,7 +44,11 @@
 
 #include <xkbcommon/xkbcommon.h>
 
+#ifdef ENABLE_EPOXY
+#include <epoxy/glx.h>
+#else
 #include <GL/glx.h>
+#endif
 #include <GL/glxext.h>
 
 #ifdef ENABLE_EGL

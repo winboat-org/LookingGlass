@@ -1,0 +1,30 @@
+name: Static Linux client
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+      - name: Build and verify static musl client
+        run: |
+          nix-build packaging/nix -A client --argstr revision "$GITHUB_SHA" --out-link result
+          nix-shell packaging/nix/shell.nix --run "python3 packaging/package-linux.py result $GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: looking-glass-linux-x64
+          path: out/*.tar.gz
+          if-no-files-found: error
+          retention-days: 90

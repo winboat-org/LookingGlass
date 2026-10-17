@@ -28,7 +28,11 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/Xfixes.h>
 
+#ifdef ENABLE_EPOXY
+#include <epoxy/glx.h>
+#else
 #include <GL/glx.h>
+#endif
 
 #include "interface/displayserver.h"
 #include "common/locking.h"

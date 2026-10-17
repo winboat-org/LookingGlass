@@ -55,7 +55,7 @@ Remove-Item out\ivshmem.tar.gz
 Copy-Item packaging\ivshmem-LICENSE "$out\ivshmem\LICENSE"
 @"
 Looking Glass: https://github.com/winboat-org/LookingGlass/tree/$Revision
-Corresponding source and symbols are included in the portable-build CI run.
+Corresponding source and symbols are included in this Windows guest build CI run.
 IVSHMEM: https://github.com/virtio-win/kvm-guest-drivers-windows/tree/master/ivshmem
 Built using the Windows 2022 runner MSBuild and WDK, with static CRT.
 "@ | Set-Content "$out\SOURCES.txt"
@@ -67,3 +67,5 @@ Get-ChildItem $out -Recurse -File | ForEach-Object {
 @{schemaVersion=1; sourceRevision=$Revision; architecture='x64'; component='idd'; crt='static'; files=$files} | ConvertTo-Json -Depth 5 | Set-Content "$out\manifest.json" -Encoding utf8NoBOM
 & tar -czf out\looking-glass-windows-x64.tar.gz -C out looking-glass
 & tar -czf out\looking-glass-windows-x64-symbols.tar.gz -C out symbols
+
+& tar -czf out\looking-glass-windows-sources.tar.gz --exclude=.git --exclude=out --exclude=packages --exclude=x64 --exclude=Debug --exclude=Release .
