@@ -13,7 +13,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
@@ -22,7 +22,7 @@ jobs:
         run: |
           nix-build packaging/nix -A client --argstr revision "$GITHUB_SHA" --out-link result
           nix-shell packaging/nix/shell.nix --run "python3 packaging/package-linux.py result $GITHUB_SHA"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: looking-glass-linux-x64
           path: out/*.tar.gz
